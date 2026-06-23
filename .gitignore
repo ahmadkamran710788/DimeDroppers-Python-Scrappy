@@ -1,0 +1,10 @@
+.venv/
+.venv*/
+output/
+output_*/
+httpcache/
+.jobs/
+jobs/
+__pycache__/
+*.pyc
+*.db

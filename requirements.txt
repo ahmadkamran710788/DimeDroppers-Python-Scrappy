@@ -1,0 +1,10 @@
+# Pin <2.13: Scrapy 2.13 deprecated and 2.16 REMOVED Spider.start_requests() in favor
+# of an async start(). The spiders here use start_requests(), so a newer Scrapy makes
+# them silently yield zero requests (empty CSVs). Keep this pin until the spiders are
+# migrated to the new start() API.
+Scrapy>=2.11,<2.13
+# Twisted 25+ removed _setAcceptableProtocols, which Scrapy 2.12 imports. Pin <25.
+Twisted>=24.7,<25
+itemadapter>=0.8
+fastapi>=0.110
+uvicorn[standard]>=0.29

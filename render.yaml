@@ -1,0 +1,18 @@
+# Render Blueprint for the MaxPreps scraper API.
+# Create the service from the Render dashboard: New + -> Blueprint -> point at this repo.
+services:
+  - type: web
+    name: dimedropper-scraper-api
+    runtime: python
+    plan: starter # free tier can kill long crawls on idle; use a paid plan for big scrapes
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      # Comma-separated list of allowed frontend origins, e.g.
+      #   https://your-app.vercel.app
+      # Leave as "*" for the first deploy, then tighten to the Vercel URL.
+      - key: FRONTEND_ORIGIN
+        value: "*"
+      - key: MAX_CONCURRENT_JOBS
+        value: "2"
