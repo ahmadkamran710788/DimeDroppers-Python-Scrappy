@@ -53,6 +53,15 @@ ITEM_PIPELINES = {
 }
 FEED_EXPORT_ENCODING = "utf-8"
 
+# --- extensions ------------------------------------------------------------ #
+# Scrapy's Telnet console errors continuously on Render's container network
+# (twisted.conch.telnet.AlreadyNegotiating / ConnectionDone at CRITICAL), which
+# destabilizes the crawl. It's a debug-only feature with no production use -> off.
+TELNETCONSOLE_ENABLED = False
+EXTENSIONS = {
+    "scrapy.extensions.telnet.TelnetConsole": None,
+}
+
 # --- misc ------------------------------------------------------------------ #
 LOG_LEVEL = "INFO"
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
