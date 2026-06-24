@@ -40,37 +40,9 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Lowercased contains-match: if any of these appear in a candidate name, it's a
-# bot-challenge / error / interstitial page, not a school name -> fall back.
-JUNK_SUBSTRINGS = (
-    "client challenge", "just a moment", "attention required",
-    "checking your browser", "are you human", "access denied",
-    "request blocked", "captcha", "cloudflare", "ddos",
-    "page not found", "not found", "forbidden", "error",
-    "page cannot be displayed", "under construction", "domain for sale",
-    "this site can", "account suspended",
-    # parked / hijacked school domains commonly serve gambling/spam landing pages
-    "poker", "casino", "slot", "togel", "judi", "betting", "viagra",
-)
-
-# Matches a bare hostname leaking through as a "name" (e.g. "normativeservices.com",
-# "www.example.org") -- no spaces, ends in a dotted TLD-like suffix.
-_BARE_DOMAIN = re.compile(r"^\S+\.[a-z]{2,}$", re.I)
-
-# Generic words that are never a school name on their own.
-GENERIC = {"home", "welcome", "website", "school", "district", "login", "index"}
-
-# A name that *begins* with one of these is a sentence fragment / slogan, not a proper
-# name (e.g. "of the Panthers" left over from "Home of the Panthers").
-LEAD_STOPWORDS = {
-    "of", "the", "a", "an", "and", "to", "for", "in", "on", "at", "is", "we", "our",
-    "your", "go", "home",
-}
-
 _SEP = re.compile(r"\s*[|\-–—•»·:]\s*")        # title separators
 _WS = re.compile(r"\s+")
 _HOME = re.compile(r"^(home|welcome(\s+to)?)\b[\s:|\-–—]*", re.I)
-_DIGITS = re.compile(r"\d+")
 
 
 def clean_title(raw):
@@ -90,35 +62,12 @@ def clean_title(raw):
     return max(segments, key=len)
 
 
-def is_clean_name(candidate):
-    """True if ``candidate`` looks like a real school/organization name (not junk)."""
-    s = (candidate or "").strip()
-    if not s:
-        return False
-    low = s.lower()
-    if any(j in low for j in JUNK_SUBSTRINGS):
-        return False
-    if low in GENERIC:
-        return False
-    if low.split()[0] in LEAD_STOPWORDS:        # sentence fragment / leftover slogan
-        return False
-    if " " not in s and _BARE_DOMAIN.match(s):  # bare hostname leaked as a "name"
-        return False
-    if not re.search(r"[a-zA-Z]", s):           # no letters at all
-        return False
-    if s.endswith(("!", "?")):                  # slogans / questions
-        return False
-    if len(s) > 70:                             # taglines, not names
-        return False
-    # short all-caps code like TBHS / LCSD2 (strip digits, then test)
-    alpha = _DIGITS.sub("", s).replace(" ", "")
-    if alpha and len(alpha) <= 5 and alpha.isupper():
-        return False
-    return True
+def extract_raw_candidate(response):
+    """First non-empty name candidate in priority order, cleaned but NOT validated.
 
-
-def extract_candidate(response):
-    """Pull a name candidate from a response, in priority order. May return None."""
+    Keeps raw/doubtful names so a successful scrape is never thrown away in favour of the
+    ``name`` column. Returns "" only when the page yields nothing extractable.
+    """
     for xp in (
         '//meta[@property="og:site_name"]/@content',
         '//meta[@property="og:title"]/@content',
@@ -126,29 +75,19 @@ def extract_candidate(response):
         '//meta[@name="og:title"]/@content',
     ):
         val = response.xpath(xp).get()
-        if val and val.strip():
-            cleaned = clean_title(val)
-            if is_clean_name(cleaned):
-                return cleaned
+        cleaned = clean_title(val)
+        if cleaned:
+            return cleaned
 
-    title = response.xpath("//title/text()").get()
-    cleaned = clean_title(title)
-    if is_clean_name(cleaned):
+    cleaned = clean_title(response.xpath("//title/text()").get())
+    if cleaned:
         return cleaned
 
     h1 = response.xpath("//h1//text()").get()
-    if h1 and is_clean_name(h1.strip()):
+    if h1 and h1.strip():
         return h1.strip()
 
-    return None
-
-
-def final_name(candidate, fallback_name):
-    """Return the candidate when it's a clean name, else the row's ``name``."""
-    cand = (candidate or "").strip()
-    if is_clean_name(cand):
-        return cand
-    return (fallback_name or "").strip()
+    return ""
 
 
 class WebsiteNameSpider(scrapy.Spider):
@@ -190,8 +129,10 @@ class WebsiteNameSpider(scrapy.Spider):
         ctype = (response.headers.get("Content-Type") or b"").decode("latin-1").lower()
         if "html" not in ctype and "xml" not in ctype:
             return  # binary/PDF/etc. -> keep fallback
-        fallback = self.rows[idx].get("name") or ""
-        self.rows[idx][NEW_COLUMN] = final_name(extract_candidate(response), fallback)
+        raw = extract_raw_candidate(response)
+        if raw:
+            self.rows[idx][NEW_COLUMN] = raw  # site opened & scraped -> use raw value
+        # else: nothing extractable -> keep the name-column fallback set in __init__
 
     def errback(self, failure):
         idx = failure.request.cb_kwargs.get("idx")
