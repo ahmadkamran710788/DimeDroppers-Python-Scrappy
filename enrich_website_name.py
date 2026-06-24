@@ -44,6 +44,25 @@ _SEP = re.compile(r"\s*[|\-–—•»·:]\s*")        # title separators
 _WS = re.compile(r"\s+")
 _HOME = re.compile(r"^(home|welcome(\s+to)?)\b[\s:|\-–—]*", re.I)
 
+# Lowercased contains-match: if any appears in a scraped name, the page is a
+# bot-challenge / error / interstitial / parked-spam screen, not a school -> fall back.
+JUNK_SUBSTRINGS = (
+    "client challenge", "just a moment", "attention required",
+    "checking your browser", "are you human", "access denied",
+    "request blocked", "captcha", "cloudflare", "ddos",
+    "page not found", "not found", "forbidden", "error",
+    "service unavailable", "temporarily unavailable", "bad gateway",
+    "gateway timeout", "internal server", "maintenance",
+    "page cannot be displayed", "under construction", "domain for sale",
+    "this site can", "account suspended",
+    "poker", "casino", "slot", "togel", "judi", "betting", "viagra",
+)
+
+
+def _is_junk(name):
+    low = (name or "").lower()
+    return any(j in low for j in JUNK_SUBSTRINGS)
+
 
 def clean_title(raw):
     """Turn a raw <title>/og:title into a best-guess organization name.
@@ -63,10 +82,11 @@ def clean_title(raw):
 
 
 def extract_raw_candidate(response):
-    """First non-empty name candidate in priority order, cleaned but NOT validated.
+    """First non-junk name candidate in priority order, cleaned but NOT name-validated.
 
-    Keeps raw/doubtful names so a successful scrape is never thrown away in favour of the
-    ``name`` column. Returns "" only when the page yields nothing extractable.
+    Keeps raw/doubtful school names so a successful scrape is never thrown away in favour
+    of the ``name`` column, but skips bot-challenge / error / parked-spam screens via
+    ``_is_junk``. Returns "" when the page yields nothing usable (-> ``name`` fallback).
     """
     for xp in (
         '//meta[@property="og:site_name"]/@content',
@@ -76,16 +96,16 @@ def extract_raw_candidate(response):
     ):
         val = response.xpath(xp).get()
         cleaned = clean_title(val)
-        if cleaned:
+        if cleaned and not _is_junk(cleaned):
             return cleaned
 
     cleaned = clean_title(response.xpath("//title/text()").get())
-    if cleaned:
+    if cleaned and not _is_junk(cleaned):
         return cleaned
 
-    h1 = response.xpath("//h1//text()").get()
-    if h1 and h1.strip():
-        return h1.strip()
+    h1 = (response.xpath("//h1//text()").get() or "").strip()
+    if h1 and not _is_junk(h1):
+        return h1
 
     return ""
 
