@@ -18,9 +18,15 @@ Usage (invoked by api.py, not by hand):
 
 Exit code 0 = crawl finished; non-zero = it failed (api.py marks the job "error").
 """
+import os
+import subprocess
 import sys
 
 from max_prep_scraper import run_crawl
+
+# Hard cap on the post-crawl website-name enrichment (seconds). Bounds total runtime on
+# large crawls; on timeout the (un-enriched) teams CSV is left intact and still usable.
+ENRICH_TIMEOUT_SECONDS = 1800
 
 
 def main():
@@ -44,6 +50,24 @@ def main():
         discover=discover,
         output_dir=output_dir,
     )
+
+    # Second phase: scrape each school's website name into an "original_name" column.
+    # Best-effort -- a Scrapy reactor can't be restarted in this process, so it runs as
+    # its own subprocess. Failures/timeouts are swallowed (check=False + try/except) so
+    # this NEVER changes the worker's exit code: the crawl already produced the teams
+    # CSV, and enrichment merely augments it. api.py marks the job done on exit code 0.
+    teams_csv = os.path.join(output_dir, "max_prep_School.csv")
+    if os.path.exists(teams_csv):
+        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            subprocess.run(
+                [sys.executable, "enrich_website_name.py", teams_csv],
+                cwd=here,
+                timeout=ENRICH_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
+            print(f"worker: enrichment skipped/failed: {exc!r}", file=sys.stderr)
 
 
 if __name__ == "__main__":

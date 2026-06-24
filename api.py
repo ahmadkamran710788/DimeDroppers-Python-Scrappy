@@ -39,6 +39,10 @@ JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
 FILENAMES = {"teams": "max_prep_School.csv", "schedule": "max_prep_schedule.csv"}
 # Cap simultaneous crawls so a burst of requests can't exhaust the instance.
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+# Wall-clock backstop: a job 'running' longer than this whose subprocess is gone is
+# treated as failed, so a crashed/hung crawl can never pin a concurrency slot forever.
+# Kept above worker.py's 1800s enrichment timeout so legitimate long jobs aren't killed.
+JOB_MAX_RUNTIME_SECONDS = int(os.environ.get("JOB_MAX_RUNTIME_SECONDS", "2700"))
 # Common high-school sports as MaxPreps labels them (for the frontend dropdown).
 COMMON_SPORTS = [
     "Football", "Basketball", "Baseball", "Softball", "Soccer", "Volleyball",
@@ -92,12 +96,26 @@ def _validate_states(raw):
 def _refresh_status(job_id):
     """Reconcile a 'running' job with its subprocess's actual exit state."""
     job = JOBS[job_id]
+    if job["status"] != "running":
+        return job
     proc = job.get("proc")
-    if job["status"] != "running" or proc is None:
+    if proc is None:
+        # No live handle but still 'running' -> a previously-started job whose process
+        # we lost track of. Fail it once it exceeds the runtime backstop so it can't
+        # pin a concurrency slot forever.
+        if time.time() - job.get("started_at", 0) > JOB_MAX_RUNTIME_SECONDS:
+            job["status"] = "error"
+            job["error"] = "job timed out"
         return job
     rc = proc.poll()
     if rc is None:
-        return job  # still running
+        # Still executing -- unless it has blown past the wall-clock backstop.
+        if time.time() - job.get("started_at", 0) > JOB_MAX_RUNTIME_SECONDS:
+            proc.terminate()
+            job["status"] = "error"
+            job["error"] = "job timed out"
+            job["proc"] = None
+        return job
     if rc == 0:
         job["status"] = "done"
     else:
@@ -105,6 +123,13 @@ def _refresh_status(job_id):
         job["error"] = f"crawl process exited with code {rc}"
     job["proc"] = None
     return job
+
+
+def _refresh_all():
+    """Reconcile every job against its subprocess. Call before counting active jobs so
+    finished-but-unpolled crawls don't falsely consume concurrency slots."""
+    for job_id in list(JOBS.keys()):
+        _refresh_status(job_id)
 
 
 def _count_rows(path):
@@ -157,6 +182,9 @@ def start_scrape(payload: dict):
     levels = (payload.get("levels") or "Varsity").strip() or "Varsity"
     discover = payload.get("discover", True)
 
+    # Reconcile finished/dead subprocesses first so only genuinely-running crawls count
+    # toward the cap (otherwise a fast-failing job stuck 'running' would block new ones).
+    _refresh_all()
     active = sum(1 for j in JOBS.values() if j["status"] == "running")
     if active >= MAX_CONCURRENT_JOBS:
         raise HTTPException(429, "too many scrapes running; try again shortly")
