@@ -45,18 +45,39 @@ NEW_COLUMN = "go_fan_ticket_url"
 
 
 def candidate_huddle_id(matcher, row):
-    """GoFan huddleId for a row, matched on ``original_name`` (fallback ``name``).
+    """GoFan huddleId for a row, with a two-attempt match. Returns ``(id, source)``.
 
-    ``Matcher.match`` reads ``row["name"]``, so we feed it a shallow copy whose ``name`` is
-    the row's ``original_name`` (when present). City/zip/state on the copy are untouched, so
-    disambiguation still works.
+    Every match is state-scoped: ``Matcher.match`` only ever searches GoFan schools in the
+    row's ``state`` column, so a candidate can never come from a different state.
+
+    Attempt order:
+      1. ``original_name`` -- match a copy of the row whose ``name`` is the scraped
+         ``original_name`` (when it's non-blank).
+      2. ``name`` fallback -- if attempt 1 found nothing (or ``original_name`` was blank),
+         match the row on its real ``name`` column.
+
+    ``source`` is ``"original"``, ``"name"``, or ``None`` (no match) -- used only for stats.
     """
+    state = (row.get("state") or "").strip()
     original = (row.get("original_name") or "").strip()
-    probe = dict(row)
-    if original:
-        probe["name"] = original
-    school_id, _kind = matcher.match(probe)
-    return school_id
+    name = (row.get("name") or "").strip()
+
+    # Attempt 1: original_name (only when it differs from name -- otherwise it's the same
+    # lookup as the fallback, so skip the redundant call).
+    if original and original != name:
+        school_id, _kind = matcher.match({"name": original, "state": state,
+                                          "city": row.get("city"), "zip_code": row.get("zip_code")})
+        if school_id:
+            return school_id, "original"
+
+    # Attempt 2: fall back to the row's name column.
+    if name:
+        school_id, _kind = matcher.match(row)
+        if school_id:
+            # Distinguish "name happened to equal original_name" from a true fallback.
+            return school_id, ("original" if original and original == name else "name")
+
+    return None, None
 
 
 class GofanTicketSpider(scrapy.Spider):
@@ -80,14 +101,20 @@ class GofanTicketSpider(scrapy.Spider):
         for row in self.rows:
             row[NEW_COLUMN] = ""
 
-        self.matched = 0  # rows that resolved to a candidate huddleId
+        self.matched = 0          # rows that resolved to a candidate huddleId
+        self.matched_original = 0  # ... via the original_name column
+        self.matched_name = 0      # ... via the name fallback
 
     def start_requests(self):
         for i, row in enumerate(self.rows):
-            school_id = candidate_huddle_id(self.matcher, row)
+            school_id, source = candidate_huddle_id(self.matcher, row)
             if not school_id:
-                continue  # no GoFan match -> column stays empty
+                continue  # no GoFan match (original_name AND name) -> column stays empty
             self.matched += 1
+            if source == "name":
+                self.matched_name += 1
+            else:
+                self.matched_original += 1
             ticket_url = TICKET_URL.format(school_id)
             yield scrapy.Request(
                 ticket_url,
@@ -117,9 +144,10 @@ class GofanTicketSpider(scrapy.Spider):
         os.replace(tmp, self.csv_path)
         verified = sum(1 for r in self.rows if (r.get(NEW_COLUMN) or "").strip())
         self.logger.info(
-            "gofan: wrote %d rows -> %s (matched %d, verified %d, empty %d)",
-            len(self.rows), self.csv_path, self.matched, verified,
-            len(self.rows) - verified,
+            "gofan: wrote %d rows -> %s (matched %d [orig %d, name-fallback %d], "
+            "verified %d, empty %d)",
+            len(self.rows), self.csv_path, self.matched, self.matched_original,
+            self.matched_name, verified, len(self.rows) - verified,
         )
 
 
