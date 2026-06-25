@@ -28,6 +28,11 @@ from max_prep_scraper import run_crawl
 # large crawls; on timeout the (un-enriched) teams CSV is left intact and still usable.
 ENRICH_TIMEOUT_SECONDS = 1800
 
+# Hard cap on the GoFan ticket-link enrichment (seconds). It only verifies one URL per
+# matched school, so it's much faster than the website-name pass; on timeout the teams CSV
+# is left intact (with original_name already present) and still usable.
+GOFAN_TIMEOUT_SECONDS = 900
+
 
 def main():
     if len(sys.argv) < 4:
@@ -68,6 +73,21 @@ def main():
             )
         except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
             print(f"worker: enrichment skipped/failed: {exc!r}", file=sys.stderr)
+
+        # Third phase: resolve each school's GoFan ticket link into a "go_fan_ticket_url"
+        # column. Reads the "original_name" added above, so it MUST run after it. Same
+        # best-effort, own-subprocess rules (Scrapy reactor can't be restarted in-process;
+        # failures are swallowed and never change the worker's exit code, and the script's
+        # atomic write means a partial run never corrupts the teams CSV).
+        try:
+            subprocess.run(
+                [sys.executable, "enrich_gofan_scrapy.py", teams_csv],
+                cwd=here,
+                timeout=GOFAN_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
+            print(f"worker: gofan enrichment skipped/failed: {exc!r}", file=sys.stderr)
 
 
 if __name__ == "__main__":
