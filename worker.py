@@ -30,6 +30,11 @@ from max_prep_scraper import run_crawl
 # the teams CSV is left intact (with original_name = MaxPreps name) and still usable.
 GOFAN_TIMEOUT_SECONDS = 900
 
+# Hard cap on the NFHS link enrichment (seconds). Matches locally against a cached catalog
+# (no per-school requests), so it's fast once the catalog is built; on timeout the teams
+# CSV is left intact and still usable.
+NFHS_TIMEOUT_SECONDS = 900
+
 
 def _copy_name_to_original_name(csv_path):
     """Write name → original_name for every row, creating the column if absent.
@@ -103,6 +108,20 @@ def main():
             )
         except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
             print(f"worker: gofan enrichment skipped/failed: {exc!r}", file=sys.stderr)
+
+        # Fourth phase: resolve each school's NFHS Network page into an "nfhs_url" column.
+        # Matches original_name (state + city gated) against NFHS's cached catalog. Own
+        # subprocess for isolation; same best-effort rules (failures swallowed, atomic
+        # write means a partial run never corrupts the teams CSV).
+        try:
+            subprocess.run(
+                [sys.executable, "enrich_nfhs.py", teams_csv],
+                cwd=here,
+                timeout=NFHS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
+            print(f"worker: nfhs enrichment skipped/failed: {exc!r}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -1,24 +1,25 @@
 #!/usr/bin/env python
 """Add each school's NFHS Network link to a schools CSV, in place.
 
-NFHS Network (https://www.nfhsnetwork.com) is, like GoFan, a PlayOnSports property,
-and its school catalog carries a ``gofan_id`` field. So resolution is mostly an exact
-join: if a row already has a ``gofan_school_id`` (added by enrich_gofan.py), we look up
-the matching NFHS school directly and take its real ``slug``. Rows without a GoFan id
-fall back to name + state matching (disambiguated by the catalog's own city).
-
-The whole NFHS catalog (~25k schools) is downloaded once via the public search API,
-cached, and matched locally — no per-school page requests, so links come straight from
-NFHS's own data rather than being guessed. Three columns are appended:
+This is the final enrichment step, run AFTER the GoFan step. For each row it resolves the
+school's NFHS Network page by matching ``original_name`` against NFHS's own catalog, gated
+on BOTH ``state`` and ``city`` -- exactly like the GoFan step, mirroring the "School Name -
+City, ST" line NFHS shows under each search result. One new column is appended:
 
     nfhs_url     https://www.nfhsnetwork.com/schools/{slug}   (or empty)
-    nfhs_slug    the NFHS slug                                (or empty)
-    nfhs_match   gofan_id | exact | fuzzy | none
+
+How the link is found
+---------------------
+The whole NFHS catalog (~16k schools) is downloaded once via the public search API,
+cached, and matched locally -- no per-school page requests, so the slug comes straight
+from NFHS's own data rather than being guessed. Matching is state-scoped (a candidate can
+only come from the row's state) and every candidate's city must agree with the row's, so a
+same-named school in a different city is never picked. Search value is ``original_name``
+(the GoFan-verified name from the previous step), falling back to the row's ``name``.
 
 Usage:
-    python enrich_nfhs.py output/ahmad.csv
-    python enrich_nfhs.py output/schools.csv
-    python enrich_nfhs.py output/ahmad.csv --refresh   # re-download the catalog
+    python enrich_nfhs.py output/max_prep_School.csv
+    python enrich_nfhs.py output/max_prep_School.csv --refresh   # re-download the catalog
 """
 import csv
 import difflib
@@ -52,7 +53,7 @@ HEADERS = {
     "Origin": "https://www.nfhsnetwork.com",
     "Referer": "https://www.nfhsnetwork.com/",
 }
-NEW_COLUMNS = ["nfhs_url", "nfhs_slug", "nfhs_match"]
+NEW_COLUMN = "nfhs_url"
 FUZZY_CUTOFF = 0.87
 PAGE_SIZE = 500  # 1000 is the hard max, but large-total states (e.g. CA) 400 at >~900;
 # 500 paginates every state reliably. (Still well under the from+size<=10000 offset cap.)
@@ -184,15 +185,12 @@ def load_catalog(refresh=False):
     return cat, True
 
 
-def build_indexes(catalog):
-    """Return (by_gofan_id: id->slug, by_state: STATE->[{norm,name,city,slug}])."""
-    by_gofan_id, by_state = {}, {}
+def build_index(catalog):
+    """state -> [{norm, name, city, slug}]."""
+    by_state = {}
     for c in catalog:
         if not c.get("slug"):
             continue
-        gid = c.get("gofan_id")
-        if gid and gid not in by_gofan_id:
-            by_gofan_id[gid] = c["slug"]
         st = (c.get("state_code") or "").upper()
         by_state.setdefault(st, []).append({
             "norm": normalize(c.get("name")),
@@ -200,43 +198,64 @@ def build_indexes(catalog):
             "city": (c.get("city") or "").strip().lower(),
             "slug": c["slug"],
         })
-    return by_gofan_id, by_state
+    return by_state
 
 
-def _city_agrees(cand_city, row_city):
-    """True if cities corroborate, or there's nothing to check against."""
-    if not row_city or not cand_city:
-        return True
-    return row_city == cand_city or row_city[:4] == cand_city[:4]
+def _city_agrees(cand_city, row_city, require_positive=False):
+    """True if a candidate's city corroborates the row's.
+
+    A city matches exactly or on a 4-char prefix (absorbing "St."/"Saint"-style and
+    "Flemington" vs "Fleming" variants). When one side has no city there's nothing to
+    check, so the match isn't blocked -- unless ``require_positive`` is set (used for weak
+    name matches, e.g. a single-word school name, where city is the only safeguard).
+    """
+    if row_city and cand_city:
+        return row_city == cand_city or row_city[:4] == cand_city[:4]
+    return not require_positive
 
 
 class Matcher:
-    def __init__(self, by_gofan_id, by_state):
-        self.by_gofan_id = by_gofan_id
+    def __init__(self, by_state):
         self.by_state = by_state
 
-    def match(self, row):
-        # 1) exact join on the GoFan id we already stored
-        gid = (row.get("gofan_school_id") or "").strip()
-        if gid and gid in self.by_gofan_id:
-            return self.by_gofan_id[gid], "gofan_id"
+    def match(self, name, state, city):
+        """Return (slug, match_type) for a name+state+city, or (None, 'none').
 
-        st = (row.get("state") or "").strip().upper()
-        n = normalize(row.get("name"))
+        State is enforced structurally (candidates only come from ``by_state[st]``) and
+        city is verified for every candidate, mirroring the GoFan matcher.
+        """
+        st = (state or "").strip().upper()
+        n = normalize(name)
         if not st or not n:
             return None, "none"
         cands = self.by_state.get(st, [])
-        row_city = (row.get("city") or "").strip().lower()
+        row_city = (city or "").strip().lower()
 
+        # Tier 1 -- exact name match in-state, city-gated.
         exact = [c for c in cands if c["norm"] == n]
-        if len(exact) == 1:
-            return exact[0]["slug"], "exact"
-        if len(exact) > 1:
-            for c in exact:
-                if _city_agrees(c["city"], row_city):
-                    return c["slug"], "exact"
-            return exact[0]["slug"], "exact"
+        for c in exact:
+            if _city_agrees(c["city"], row_city):
+                return c["slug"], "exact"
+        if exact:
+            return None, "none"
 
+        # Tier 2 -- token containment ("Little Snake River" vs "Little Snake River Valley
+        # School", "East" vs "Cheyenne East High School"). A single-word row name is weak,
+        # so it demands a positive city hit. Ordered by fewest extra words.
+        row_toks = set(n.split())
+        strict = len(row_toks) < 2
+        subset = []
+        for c in cands:
+            cat_toks = set(c["norm"].split())
+            if not cat_toks:
+                continue
+            if row_toks <= cat_toks or cat_toks <= row_toks:
+                subset.append((abs(len(cat_toks) - len(row_toks)), c))
+        for _extra, c in sorted(subset, key=lambda t: t[0]):
+            if _city_agrees(c["city"], row_city, require_positive=strict):
+                return c["slug"], "fuzzy"
+
+        # Tier 3 -- fuzzy difflib match within the state, city-gated.
         close = difflib.get_close_matches(n, [c["norm"] for c in cands], n=1, cutoff=FUZZY_CUTOFF)
         if close:
             c = next(c for c in cands if c["norm"] == close[0])
@@ -245,21 +264,37 @@ class Matcher:
         return None, "none"
 
 
+def candidate_slug(matcher, row):
+    """NFHS slug for a row, searching original_name first, then name. Or None."""
+    state, city = row.get("state"), row.get("city")
+    original = (row.get("original_name") or "").strip()
+    name = (row.get("name") or "").strip()
+
+    if original:
+        slug, _kind = matcher.match(original, state, city)
+        if slug:
+            return slug
+    if name and name != original:
+        slug, _kind = matcher.match(name, state, city)
+        if slug:
+            return slug
+    return None
+
+
 def enrich_csv(path, matcher):
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         rows = list(reader)
         fields = list(reader.fieldnames or [])
 
-    out_fields = fields + [c for c in NEW_COLUMNS if c not in fields]  # idempotent
+    out_fields = fields + ([] if NEW_COLUMN in fields else [NEW_COLUMN])  # idempotent
 
-    counts = {"gofan_id": 0, "exact": 0, "fuzzy": 0, "none": 0}
+    matched = 0
     for row in rows:
-        slug, kind = matcher.match(row)
-        row["nfhs_url"] = SCHOOL_URL.format(slug) if slug else ""
-        row["nfhs_slug"] = slug or ""
-        row["nfhs_match"] = kind
-        counts[kind] += 1
+        slug = candidate_slug(matcher, row)
+        row[NEW_COLUMN] = SCHOOL_URL.format(slug) if slug else ""
+        if slug:
+            matched += 1
 
     tmp = path + ".tmp"
     with open(tmp, "w", newline="", encoding="utf-8") as fh:
@@ -269,11 +304,9 @@ def enrich_csv(path, matcher):
     os.replace(tmp, path)
 
     total = len(rows)
-    matched = total - counts["none"]
     print(
-        f"{path}: {total} rows | gofan_id {counts['gofan_id']} | exact {counts['exact']} "
-        f"| fuzzy {counts['fuzzy']} | none {counts['none']} "
-        f"| matched {matched} ({matched * 100 // total if total else 0}%)"
+        f"{path}: {total} rows | nfhs matched {matched} | empty {total - matched} "
+        f"({matched * 100 // total if total else 0}%)"
     )
 
 
@@ -294,9 +327,7 @@ def main():
               "just run this command again to resume and finish. CSV not modified.",
               file=sys.stderr)
         sys.exit(3)
-    by_gofan_id, by_state = build_indexes(catalog)
-    print(f"index: {len(by_gofan_id)} schools with a gofan_id join key")
-    enrich_csv(csv_path, Matcher(by_gofan_id, by_state))
+    enrich_csv(csv_path, Matcher(build_index(catalog)))
 
 
 if __name__ == "__main__":
