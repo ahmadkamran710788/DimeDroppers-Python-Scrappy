@@ -120,7 +120,7 @@ class Matcher:
         return self._detail[school_id]
 
     @staticmethod
-    def _agrees(detail, row):
+    def _agrees(detail, row, require_positive=False):
         """True if a candidate's city or zip corroborates the CSV row.
 
         Matching mirrors the GoFan search UI, which shows "City, ST" under every
@@ -133,6 +133,10 @@ class Matcher:
           * Row has no city AND no zip   -> nothing to check, don't block.
           * Candidate detail has no city AND no zip -> unverifiable; don't block
             (name+state already identifies it and there's nothing to contradict).
+
+        ``require_positive=True`` drops both permissive fallbacks: the candidate is
+        accepted ONLY on a real zip/city hit. Used for weak name matches (e.g. a
+        single-word school name) where city is the only thing keeping it honest.
         """
         city = (detail.get("city") or "").strip().lower()
         zc = (detail.get("zipCode") or "").strip()[:5]
@@ -142,6 +146,8 @@ class Matcher:
             return True
         if row_city and city and (row_city == city or row_city[:4] == city[:4]):
             return True
+        if require_positive:
+            return False  # weak name match -> demand a real city/zip corroboration
         # Nothing on one side to compare against -> can't disprove, so allow it.
         if not (row_city or row_zip):
             return True
@@ -168,7 +174,7 @@ class Matcher:
             return None, "none"
         cands = self.by_state.get(st, [])
 
-        # Exact name matches in-state, each gated on city/zip agreement.
+        # Tier 1 -- exact name matches in-state, each gated on city/zip agreement.
         exact = [c for c in cands if c["norm"] == n]
         for c in exact:
             if self._agrees(self.detail(c["id"]), row):
@@ -176,7 +182,28 @@ class Matcher:
         if exact:
             return None, "none"  # right name+state, but no candidate's city agreed
 
-        # Fuzzy: best close match within the state, also verified by city/zip.
+        # Tier 2 -- token containment. The row's words are the full set of a longer
+        # catalog name (or vice-versa), e.g. "Little Snake River" vs "Little Snake
+        # River Valley School", "St. Stephens" vs "St. Stephens Indian High School",
+        # or "East" vs "Cheyenne East High School". difflib's whole-string ratio
+        # penalises the length gap below the cutoff, so handle this subset case
+        # explicitly. Candidates are ordered by fewest extra words and gated on
+        # city/zip. A single-word row name is weak, so for it we demand a positive
+        # city/zip hit (require_positive) -- the city is the only safeguard.
+        row_toks = set(n.split())
+        strict = len(row_toks) < 2
+        subset = []
+        for c in cands:
+            cat_toks = set(c["norm"].split())
+            if not cat_toks:
+                continue
+            if row_toks <= cat_toks or cat_toks <= row_toks:
+                subset.append((abs(len(cat_toks) - len(row_toks)), c))
+        for _extra, c in sorted(subset, key=lambda t: t[0]):
+            if self._agrees(self.detail(c["id"]), row, require_positive=strict):
+                return c["id"], "fuzzy"
+
+        # Tier 3 -- fuzzy difflib match within the state, also verified by city/zip.
         names = [c["norm"] for c in cands]
         close = difflib.get_close_matches(n, names, n=1, cutoff=FUZZY_CUTOFF)
         if close:
