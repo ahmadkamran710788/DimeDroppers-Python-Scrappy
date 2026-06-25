@@ -18,20 +18,41 @@ Usage (invoked by api.py, not by hand):
 
 Exit code 0 = crawl finished; non-zero = it failed (api.py marks the job "error").
 """
+import csv
 import os
 import subprocess
 import sys
 
 from max_prep_scraper import run_crawl
 
-# Hard cap on the post-crawl website-name enrichment (seconds). Bounds total runtime on
-# large crawls; on timeout the (un-enriched) teams CSV is left intact and still usable.
-ENRICH_TIMEOUT_SECONDS = 1800
-
-# Hard cap on the GoFan ticket-link enrichment (seconds). It only verifies one URL per
-# matched school, so it's much faster than the website-name pass; on timeout the teams CSV
-# is left intact (with original_name already present) and still usable.
+# Hard cap on the GoFan ticket-link enrichment (seconds). It verifies one URL per matched
+# school and overwrites original_name with the GoFan catalog name on success; on timeout
+# the teams CSV is left intact (with original_name = MaxPreps name) and still usable.
 GOFAN_TIMEOUT_SECONDS = 900
+
+
+def _copy_name_to_original_name(csv_path):
+    """Write name → original_name for every row, creating the column if absent.
+
+    Idempotent: safe to call on a CSV that already has original_name (e.g. a re-run).
+    The GoFan step will overwrite original_name with the verified GoFan school name for
+    every row it successfully matches; rows with no GoFan match keep this MaxPreps name.
+    """
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    out_fields = fieldnames + ([] if "original_name" in fieldnames else ["original_name"])
+    for row in rows:
+        row["original_name"] = (row.get("name") or "").strip()
+
+    tmp = csv_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=out_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, csv_path)
 
 
 def main():
@@ -56,29 +77,23 @@ def main():
         output_dir=output_dir,
     )
 
-    # Second phase: scrape each school's website name into an "original_name" column.
-    # Best-effort -- a Scrapy reactor can't be restarted in this process, so it runs as
-    # its own subprocess. Failures/timeouts are swallowed (check=False + try/except) so
-    # this NEVER changes the worker's exit code: the crawl already produced the teams
-    # CSV, and enrichment merely augments it. api.py marks the job done on exit code 0.
     teams_csv = os.path.join(output_dir, "max_prep_School.csv")
     if os.path.exists(teams_csv):
         here = os.path.dirname(os.path.abspath(__file__))
-        try:
-            subprocess.run(
-                [sys.executable, "enrich_website_name.py", teams_csv],
-                cwd=here,
-                timeout=ENRICH_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
-            print(f"worker: enrichment skipped/failed: {exc!r}", file=sys.stderr)
 
-        # Third phase: resolve each school's GoFan ticket link into a "go_fan_ticket_url"
-        # column. Reads the "original_name" added above, so it MUST run after it. Same
-        # best-effort, own-subprocess rules (Scrapy reactor can't be restarted in-process;
-        # failures are swallowed and never change the worker's exit code, and the script's
-        # atomic write means a partial run never corrupts the teams CSV).
+        # Second phase: copy the MaxPreps "name" column into "original_name".
+        # This gives the GoFan step a search value and acts as the fallback for rows
+        # where no GoFan match is found. Done inline (no subprocess) -- it's a plain
+        # CSV read+write, no Scrapy reactor involved.
+        try:
+            _copy_name_to_original_name(teams_csv)
+        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
+            print(f"worker: original_name copy failed: {exc!r}", file=sys.stderr)
+
+        # Third phase: match each school against GoFan's catalog (state + city gated),
+        # verify the candidate URL (HTTP 200), write "go_fan_ticket_url", and replace
+        # "original_name" with the school's verified GoFan name. Own-subprocess because
+        # Scrapy's Twisted reactor can only run once per process.
         try:
             subprocess.run(
                 [sys.executable, "enrich_gofan_scrapy.py", teams_csv],

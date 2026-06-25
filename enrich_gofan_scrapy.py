@@ -1,35 +1,31 @@
 #!/usr/bin/env python
 """Add each school's GoFan ticket link to a schools CSV, keyed on ``original_name``.
 
-This is the Scrapy-based GoFan enrichment step. It runs AFTER ``enrich_website_name.py``
-has populated the ``original_name`` column (the school's name as it appears on its own
-website). For each row it resolves the GoFan ticket link and appends one new column:
+This is the Scrapy-based GoFan enrichment step. It runs AFTER ``worker.py`` has copied
+the MaxPreps ``name`` column into ``original_name`` as the initial search value. For each
+row it resolves the GoFan ticket link AND replaces ``original_name`` with the verified
+GoFan school name, producing two updated columns:
 
     go_fan_ticket_url   https://gofan.co/app/school/{huddleId}   (or empty)
+    original_name       the school's name as it appears on GoFan  (or the MaxPreps name
+                        when no GoFan match / URL verification fails)
 
 How the link is found
 ---------------------
-GoFan has no usable server-side search endpoint (``api.gofan.co/v2/schools?q=...`` ignores
-the query and returns the full unfiltered catalog), so a link is resolved in two steps:
+GoFan has no usable server-side search endpoint, so a link is resolved in two steps:
 
-1. **Match** ``original_name`` against GoFan's full catalog locally -- reusing the proven
-   matcher from ``enrich_gofan.py``. The match is gated on BOTH ``state`` and ``city``: the
-   candidate must be in the row's state (enforced structurally) AND its city/zip must agree
-   with the row's, mirroring the "City, ST" line GoFan shows under each search result. This
-   yields a GoFan ``huddleId``. (Falls back to the row's ``name`` if ``original_name`` is
-   blank, so it's safe on CSVs that predate the ``original_name`` column.)
-2. **Verify** the candidate ``https://gofan.co/app/school/{huddleId}`` with **Scrapy** -- one
-   request per matched row. Only URLs that resolve (HTTP 200) are written; anything else
-   leaves the column empty.
+1. **Match** ``original_name`` (= MaxPreps ``name``) against GoFan's local catalog. The
+   match is gated on BOTH ``state`` and ``city`` so it mirrors the "City, ST" result line
+   shown on GoFan's own search UI. This yields a ``huddleId`` AND the GoFan school name.
+2. **Verify** ``https://gofan.co/app/school/{huddleId}`` with Scrapy (HTTP 200 check).
+   On success both columns are written; on non-200 / error both keep their fallback values.
 
-Like the rest of this project, each Scrapy run owns one Twisted reactor that cannot be
-restarted -- so this MUST run in its own process:
+GoFan's school pages are React SPAs -- the school name is not in the HTML. Instead the
+verified name comes from GoFan's own catalog (already downloaded locally), so no extra
+network round-trip is needed.
 
     python enrich_gofan_scrapy.py output/max_prep_School.csv
     python enrich_gofan_scrapy.py output/max_prep_School.csv --refresh   # re-download catalog
-
-It is idempotent (re-running just recomputes the column) and writes atomically (tmp file +
-``os.replace``), so a crash or timeout never leaves a half-written CSV.
 """
 import csv
 import os
@@ -44,42 +40,38 @@ from enrich_gofan import TICKET_URL, Matcher, build_index, load_catalog
 from enrich_website_name import _settings
 
 NEW_COLUMN = "go_fan_ticket_url"
+ORIGINAL_NAME_COLUMN = "original_name"
 
 
 def candidate_huddle_id(matcher, row):
-    """GoFan huddleId for a row, with a two-attempt match. Returns ``(id, source)``.
+    """GoFan huddleId + catalog name for a row. Returns ``(id, source, gofan_name)``.
 
-    Every match is state-scoped: ``Matcher.match`` only ever searches GoFan schools in the
-    row's ``state`` column, so a candidate can never come from a different state.
+    Every match is state-scoped and city-verified. Attempt order:
+      1. ``original_name`` (= MaxPreps name copied by worker.py)
+      2. ``name`` fallback if original_name is blank
 
-    Attempt order:
-      1. ``original_name`` -- match a copy of the row whose ``name`` is the scraped
-         ``original_name`` (when it's non-blank).
-      2. ``name`` fallback -- if attempt 1 found nothing (or ``original_name`` was blank),
-         match the row on its real ``name`` column.
-
-    ``source`` is ``"original"``, ``"name"``, or ``None`` (no match) -- used only for stats.
+    ``gofan_name`` is the school's name as stored in GoFan's own catalog -- used to
+    overwrite ``original_name`` after the URL is verified.
     """
     state = (row.get("state") or "").strip()
     original = (row.get("original_name") or "").strip()
     name = (row.get("name") or "").strip()
 
-    # Attempt 1: original_name (only when it differs from name -- otherwise it's the same
-    # lookup as the fallback, so skip the redundant call).
+    # Attempt 1: original_name (skip if it equals name -- same lookup, avoid duplicate).
     if original and original != name:
         school_id, _kind = matcher.match({"name": original, "state": state,
                                           "city": row.get("city"), "zip_code": row.get("zip_code")})
         if school_id:
-            return school_id, "original"
+            return school_id, "original", matcher.id_to_name.get(school_id, "")
 
-    # Attempt 2: fall back to the row's name column.
+    # Attempt 2: name column.
     if name:
         school_id, _kind = matcher.match(row)
         if school_id:
-            # Distinguish "name happened to equal original_name" from a true fallback.
-            return school_id, ("original" if original and original == name else "name")
+            source = "original" if original and original == name else "name"
+            return school_id, source, matcher.id_to_name.get(school_id, "")
 
-    return None, None
+    return None, None, ""
 
 
 class GofanTicketSpider(scrapy.Spider):
@@ -94,12 +86,14 @@ class GofanTicketSpider(scrapy.Spider):
             self.rows = list(reader)
             self.fieldnames = list(reader.fieldnames or [])
 
-        # Append the new column exactly once (idempotent on re-run).
-        self.out_fields = self.fieldnames + (
-            [] if NEW_COLUMN in self.fieldnames else [NEW_COLUMN]
-        )
-        # Pre-fill EVERY row to empty so no row is ever lost (no-match / errored / non-200
-        # rows simply keep this value); ``parse`` overwrites only on a verified 200.
+        # Ensure both output columns exist exactly once (idempotent on re-run).
+        extra = [c for c in (ORIGINAL_NAME_COLUMN, NEW_COLUMN) if c not in self.fieldnames]
+        self.out_fields = self.fieldnames + extra
+
+        # Pre-fill go_fan_ticket_url to empty for every row; parse() overwrites on 200.
+        # original_name is already populated (worker.py copied name → original_name before
+        # launching this script), so we leave it intact here -- parse() overwrites it with
+        # the GoFan catalog name only on a verified 200.
         for row in self.rows:
             row[NEW_COLUMN] = ""
 
@@ -109,9 +103,9 @@ class GofanTicketSpider(scrapy.Spider):
 
     def start_requests(self):
         for i, row in enumerate(self.rows):
-            school_id, source = candidate_huddle_id(self.matcher, row)
+            school_id, source, gofan_name = candidate_huddle_id(self.matcher, row)
             if not school_id:
-                continue  # no GoFan match (original_name AND name) -> column stays empty
+                continue  # no GoFan match -> both columns keep their fallback values
             self.matched += 1
             if source == "name":
                 self.matched_name += 1
@@ -122,15 +116,20 @@ class GofanTicketSpider(scrapy.Spider):
                 ticket_url,
                 callback=self.parse,
                 errback=self.errback,
-                cb_kwargs={"idx": i, "url": ticket_url},
+                cb_kwargs={"idx": i, "url": ticket_url, "gofan_name": gofan_name},
                 dont_filter=True,
                 meta={"download_timeout": 15},
             )
 
-    def parse(self, response, idx, url):
+    def parse(self, response, idx, url, gofan_name):
         if response.status == 200:
             self.rows[idx][NEW_COLUMN] = url
-        # non-200 -> keep the empty fallback
+            # Replace original_name with GoFan's own school name (from the local catalog).
+            # GoFan pages are React SPAs so the name isn't in the HTML; the catalog already
+            # has it, so no extra HTTP request is needed.
+            if gofan_name:
+                self.rows[idx][ORIGINAL_NAME_COLUMN] = gofan_name
+        # non-200 -> both columns keep their fallback values (name for original_name, "" for url)
 
     def errback(self, failure):
         idx = failure.request.cb_kwargs.get("idx")

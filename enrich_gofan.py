@@ -108,6 +108,12 @@ class Matcher:
         self.by_state = by_state
         self._detail = {}          # huddleId -> detail dict (memoized)
         self.detail_fetches = 0
+        # reverse lookup: huddleId -> GoFan catalog name (used to write original_name)
+        self.id_to_name = {
+            c["id"]: c["name"]
+            for cands in by_state.values()
+            for c in cands
+        }
 
     def detail(self, school_id):
         if school_id not in self._detail:
