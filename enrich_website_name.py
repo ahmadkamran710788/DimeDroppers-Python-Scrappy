@@ -55,6 +55,7 @@ JUNK_SUBSTRINGS = (
     "gateway timeout", "internal server", "maintenance",
     "page cannot be displayed", "under construction", "domain for sale",
     "this site can", "account suspended",
+    "just another", "wordpress site",   # default WordPress taglines, not a name
     # soft-404 / error pages that return HTTP 200 (e.g. Rails' default 404 page),
     # so the status check in parse() never sees them:
     "you were looking for", "doesn't exist", "does not exist",
@@ -82,6 +83,11 @@ def clean_title(raw):
     Strips a leading "Home"/"Welcome to", splits on separators (| - : • ...) and keeps
     the longest segment -- school/district names tend to be the longest meaningful part,
     while slogans and section labels are short.
+
+    Junk segments (WordPress taglines, error text, parked-domain spam) are dropped
+    *before* picking the longest, so a poisoned field like "Cokeville High School -
+    Just another ... Sites site" yields "Cokeville High School" rather than the
+    longer-but-useless tagline segment.
     """
     s = _WS.sub(" ", (raw or "")).strip()
     s = _HOME.sub("", s).strip()
@@ -90,7 +96,8 @@ def clean_title(raw):
     segments = [seg.strip() for seg in _SEP.split(s) if seg.strip()]
     if not segments:
         return ""
-    return max(segments, key=len)
+    good = [seg for seg in segments if not _is_junk(seg)]
+    return max(good or segments, key=len)
 
 
 def extract_raw_candidate(response):
