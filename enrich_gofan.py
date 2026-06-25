@@ -121,7 +121,19 @@ class Matcher:
 
     @staticmethod
     def _agrees(detail, row):
-        """True if a candidate's city or zip corroborates the CSV row."""
+        """True if a candidate's city or zip corroborates the CSV row.
+
+        Matching mirrors the GoFan search UI, which shows "City, ST" under every
+        result: a candidate is accepted only when its city (or zip) lines up with
+        the row's. A row zip equal to the candidate's zip, or a city that matches
+        (exactly or on a 4-char prefix, to absorb "Flemington" vs "Fleming"-style
+        spellings), corroborates the match.
+
+        Edge cases:
+          * Row has no city AND no zip   -> nothing to check, don't block.
+          * Candidate detail has no city AND no zip -> unverifiable; don't block
+            (name+state already identifies it and there's nothing to contradict).
+        """
         city = (detail.get("city") or "").strip().lower()
         zc = (detail.get("zipCode") or "").strip()[:5]
         row_city = (row.get("city") or "").strip().lower()
@@ -130,28 +142,41 @@ class Matcher:
             return True
         if row_city and city and (row_city == city or row_city[:4] == city[:4]):
             return True
-        # if the row carries no city/zip to check against, don't block the match
-        return not (row_city or row_zip)
+        # Nothing on one side to compare against -> can't disprove, so allow it.
+        if not (row_city or row_zip):
+            return True
+        if not (city or zc):
+            return True
+        # Both sides carry a city/zip but they disagree -> reject (wrong city).
+        return False
 
     def match(self, row):
-        """Return (huddleId, match_type) for a CSV row, or (None, 'none')."""
+        """Return (huddleId, match_type) for a CSV row, or (None, 'none').
+
+        Both ``state`` and ``city`` are verified before a match is returned:
+
+          * **state** is enforced structurally -- candidates are only ever drawn
+            from ``by_state[st]``, so a match can never cross state lines.
+          * **city** (or zip) is checked via ``_agrees`` for *every* candidate,
+            including a lone exact name match. A school whose name matches in the
+            right state but whose city disagrees is rejected, so we never write a
+            ticket URL for a same-named school in the wrong city.
+        """
         st = (row.get("state") or "").strip().upper()
         n = normalize(row.get("name"))
         if not st or not n:
             return None, "none"
         cands = self.by_state.get(st, [])
 
+        # Exact name matches in-state, each gated on city/zip agreement.
         exact = [c for c in cands if c["norm"] == n]
-        if len(exact) == 1:
-            return exact[0]["id"], "exact"
-        if len(exact) > 1:
-            # disambiguate same-named schools by city/zip
-            for c in exact:
-                if self._agrees(self.detail(c["id"]), row):
-                    return c["id"], "exact"
-            return exact[0]["id"], "exact"  # fall back to first; still a real match
+        for c in exact:
+            if self._agrees(self.detail(c["id"]), row):
+                return c["id"], "exact"
+        if exact:
+            return None, "none"  # right name+state, but no candidate's city agreed
 
-        # fuzzy: best close match within the state, verified by city/zip
+        # Fuzzy: best close match within the state, also verified by city/zip.
         names = [c["norm"] for c in cands]
         close = difflib.get_close_matches(n, names, n=1, cutoff=FUZZY_CUTOFF)
         if close:

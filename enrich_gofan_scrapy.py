@@ -12,10 +12,12 @@ How the link is found
 GoFan has no usable server-side search endpoint (``api.gofan.co/v2/schools?q=...`` ignores
 the query and returns the full unfiltered catalog), so a link is resolved in two steps:
 
-1. **Match** ``original_name`` (+ ``state``, with city/zip disambiguation) against GoFan's
-   full catalog locally -- reusing the proven matcher from ``enrich_gofan.py``. This yields
-   a GoFan ``huddleId``. (Falls back to the row's ``name`` if ``original_name`` is blank, so
-   it's safe on CSVs that predate the ``original_name`` column.)
+1. **Match** ``original_name`` against GoFan's full catalog locally -- reusing the proven
+   matcher from ``enrich_gofan.py``. The match is gated on BOTH ``state`` and ``city``: the
+   candidate must be in the row's state (enforced structurally) AND its city/zip must agree
+   with the row's, mirroring the "City, ST" line GoFan shows under each search result. This
+   yields a GoFan ``huddleId``. (Falls back to the row's ``name`` if ``original_name`` is
+   blank, so it's safe on CSVs that predate the ``original_name`` column.)
 2. **Verify** the candidate ``https://gofan.co/app/school/{huddleId}`` with **Scrapy** -- one
    request per matched row. Only URLs that resolve (HTTP 200) are written; anything else
    leaves the column empty.
