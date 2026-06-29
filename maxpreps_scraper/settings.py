@@ -5,6 +5,7 @@ rate-limits aggressive crawlers. AutoThrottle + a modest concurrency keep us und
 the radar; retries with backoff handle the occasional 403/429. For a true
 nationwide run you will likely still want rotating proxies (see README).
 """
+import os
 
 BOT_NAME = "maxpreps_scraper"
 SPIDER_MODULES = ["maxpreps_scraper.spiders"]
@@ -61,6 +62,21 @@ TELNETCONSOLE_ENABLED = False
 EXTENSIONS = {
     "scrapy.extensions.telnet.TelnetConsole": None,
 }
+
+# --- memory & time guards (graceful stop -> partial CSV, never an OS OOM kill) - #
+# The MemoryUsage extension is enabled by default; giving it a limit makes it close the
+# spider GRACEFULLY (flushing the partial CSVs) before the host OOM-kills the process.
+# Sized for a 2 GB box with MAX_CONCURRENT_JOBS=1: one crawl (~1600) + ~400 MB for the
+# web server + OS + the overshoot between memory checks during graceful shutdown ≈ 2 GB.
+# This cap is PER PROCESS -- if you raise MAX_CONCURRENT_JOBS, you MUST lower this
+# proportionally (limit ~= (RAM_MB - ~400 overhead) / concurrent jobs), or two crawls
+# will together exceed RAM and trigger an ungraceful OS OOM kill. JOBDIR keeps the real
+# baseline far below this (~55-70 MB observed), so the cap is a safety net, not a target.
+MEMUSAGE_LIMIT_MB = int(os.environ.get("MEMUSAGE_LIMIT_MB", "1600"))
+MEMUSAGE_WARNING_MB = int(os.environ.get("MEMUSAGE_WARNING_MB", "1300"))
+# Graceful wall-clock cap: the crawl self-closes with partial data instead of being
+# terminated by api.py's watchdog. 0 disables (rely on the memory guard only).
+CLOSESPIDER_TIMEOUT = int(os.environ.get("CLOSESPIDER_TIMEOUT", "1800"))
 
 # --- misc ------------------------------------------------------------------ #
 LOG_LEVEL = "INFO"
