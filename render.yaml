@@ -4,7 +4,7 @@ services:
   - type: web
     name: dimedropper-scraper-api
     runtime: python
-    plan: starter # free tier can kill long crawls on idle; use a paid plan for big scrapes
+    plan: standard # 2 GB RAM / 1 CPU. starter (512 MB) OOM-kills big-state discovery crawls.
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
@@ -14,5 +14,18 @@ services:
       # Leave as "*" for the first deploy, then tighten to the Vercel URL.
       - key: FRONTEND_ORIGIN
         value: "*"
+      # Must be 1 while MEMUSAGE_LIMIT_MB is high: the cap is per-process, so two crawls
+      # at 1600 MB would exceed the 2 GB box and cause an ungraceful OS OOM kill. To run
+      # 2 concurrently, drop MEMUSAGE_LIMIT_MB to ~800 first.
       - key: MAX_CONCURRENT_JOBS
         value: "2"
+      # Graceful memory cap per crawl (MB). The crawl closes itself and flushes partial
+      # CSVs before the 2 GB host OOM-kills it. 1600 + ~400 MB (web/OS/overshoot) ≈ 2 GB.
+      - key: MEMUSAGE_LIMIT_MB
+        value: "1600"
+      # Graceful wall-clock cap per crawl (s); self-closes with partial data. 0 disables.
+      - key: CLOSESPIDER_TIMEOUT
+        value: "1800"
+      # Last-resort watchdog (s); must exceed CLOSESPIDER_TIMEOUT + GoFan 900 + NFHS 900.
+      - key: JOB_MAX_RUNTIME_SECONDS
+        value: "3900"

@@ -143,6 +143,11 @@ def run_crawl(states, sports, levels="Varsity", discover=True, output_dir=None):
     settings.set("ITEM_PIPELINES", {MaxPrepTwoFilePipeline: 300})
     if output_dir:
         settings.set("OUTPUT_DIR", output_dir)
+        # Disk-backed scheduler queue + dupefilter: a discovery crawl of a large state
+        # is an unbounded graph walk whose pending-request queue would otherwise live
+        # entirely in RAM and OOM the instance. JOBDIR spills it to disk. Each API job
+        # gets a unique output_dir, so this dir is always fresh (no accidental resume).
+        settings.set("JOBDIR", os.path.join(output_dir, ".crawljob"))
 
     process = CrawlerProcess(settings)
     process.crawl(
