@@ -178,9 +178,10 @@ def list_sports():
 @app.post("/scrape")
 def start_scrape(payload: dict):
     states = _validate_states(payload.get("states"))
+    # No sport filter: an empty/absent `sports` means "scrape all sports". It flows through
+    # worker.py -> run_crawl -> FilteredMaxPrepsSpider, which treats an empty value as
+    # target_sports=None (no filtering). See DD-Scrapper/max_prep_scraper.py.
     sports = (payload.get("sports") or "").strip()
-    if not sports:
-        raise HTTPException(400, "sports is required (e.g. 'Football' or 'Football,Basketball')")
     levels = (payload.get("levels") or "Varsity").strip() or "Varsity"
     discover = payload.get("discover", True)
 
