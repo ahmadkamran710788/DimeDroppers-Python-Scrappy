@@ -24,8 +24,18 @@ services:
       - key: MEMUSAGE_LIMIT_MB
         value: "1600"
       # Graceful wall-clock cap per crawl (s); self-closes with partial data. 0 disables.
+      # Set high (4 h) so a single-state, all-sports discovery crawl runs to full
+      # convergence instead of being truncated at 30 min (the old 1800 left big states
+      # -- and even FL -- with missing schools). JOBDIR keeps memory ~55-70 MB, so the
+      # binding limit is time, not RAM. A graceful self-close still flushes the CSV and
+      # runs enrichment, so keep this a finite value (below the watchdog) rather than 0.
+      # NOTE: guaranteed 100% coverage of the very largest states / multi-state "all"
+      # runs is still best done locally with backfill_all.py (fully uncapped). The 2 GB
+      # box bounds what a live web crawl can realistically finish.
       - key: CLOSESPIDER_TIMEOUT
-        value: "1800"
-      # Last-resort watchdog (s); must exceed CLOSESPIDER_TIMEOUT + GoFan 900 + NFHS 900.
+        value: "14400"
+      # Last-resort watchdog (s); must exceed CLOSESPIDER_TIMEOUT + GoFan 900 + NFHS 900
+      # (= 16200) so a legitimate long crawl self-closes gracefully before the watchdog
+      # terminates it mid-run. 18000 leaves ~30 min of margin.
       - key: JOB_MAX_RUNTIME_SECONDS
-        value: "3900"
+        value: "18000"
