@@ -25,7 +25,7 @@ SCHOOL_FIELDS = [
     "sports", "sports_count", "discovered_via",
 ]
 GAME_FIELDS = [
-    "school_id", "school_name", "state", "sport", "gender", "season",
+    "school_id", "school_name", "state", "sport", "gender", "season", "level",
     "game_index", "date", "home_away", "opponent", "opponent_url",
     "result", "score", "game_info", "schedule_url",
 ]

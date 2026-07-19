@@ -60,6 +60,7 @@ class ScheduleGameItem(scrapy.Item):
     sport = scrapy.Field()
     gender = scrapy.Field()
     season = scrapy.Field()
+    level = scrapy.Field()        # Varsity / JV / Freshman
     schedule_url = scrapy.Field()
 
     # the game itself

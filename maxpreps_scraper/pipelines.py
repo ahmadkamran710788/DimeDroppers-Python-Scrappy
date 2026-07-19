@@ -68,7 +68,20 @@ class MultiFormatPipeline:
             + ", ".join(f'"{f}" TEXT' for f in GAME_FIELDS)
             + ', PRIMARY KEY ("school_id", "schedule_url", "game_index"))'
         )
+        # Lightweight migration: CREATE TABLE IF NOT EXISTS leaves a pre-existing table
+        # untouched, so a DB built before a field was added (e.g. games.level) lacks the
+        # new column and INSERT would fail with "no column named ...". Add any missing
+        # columns in place so re-crawls against an old maxpreps.db keep working.
+        self._ensure_columns(cur, "schools", SCHOOL_FIELDS)
+        self._ensure_columns(cur, "games", GAME_FIELDS)
         self._db.commit()
+
+    @staticmethod
+    def _ensure_columns(cur, table, fields):
+        existing = {row[1] for row in cur.execute(f'PRAGMA table_info("{table}")')}
+        for f in fields:
+            if f not in existing:
+                cur.execute(f'ALTER TABLE "{table}" ADD COLUMN "{f}" TEXT')
 
     # ------------------------------------------------------------------ #
     def process_item(self, item, spider):

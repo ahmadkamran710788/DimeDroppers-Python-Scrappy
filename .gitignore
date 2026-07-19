@@ -8,3 +8,5 @@ jobs/
 __pycache__/
 *.pyc
 *.db
+config.bat
+node_modules

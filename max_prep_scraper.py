@@ -51,24 +51,13 @@ class FilteredMaxPrepsSpider(MaxPrepsSpider):
     def _season_matches(self, sport):
         return bool(self.target_sports) and (sport or "").strip().lower() in self.target_sports
 
-    def _school_offers_target(self, item):
-        # SchoolItem.sports looks like ["Football (Boys)", "Basketball (Girls)", ...]
-        for label in item.get("sports") or []:
-            if label.split(" (")[0].strip().lower() in self.target_sports:
-                return True
-        return False
-
     def parse_school(self, response, discovered_via):
         # Reuse the parent's logic entirely and just filter what it yields:
-        #   - drop schools that don't offer any requested sport,
+        #   - keep EVERY school (the teams list is never narrowed by the sport filter),
         #   - drop schedule requests for non-requested sports,
         #   - let discovery requests through so coverage still expands.
         for out in super().parse_school(response, discovered_via=discovered_via):
-            if isinstance(out, SchoolItem):
-                if self.target_sports and not self._school_offers_target(out):
-                    continue
-                yield out
-            elif isinstance(out, scrapy.Request) and out.callback == self.parse_schedule:
+            if isinstance(out, scrapy.Request) and out.callback == self.parse_schedule:
                 team = out.cb_kwargs.get("team") or {}
                 if self.target_sports and not self._season_matches(team.get("sport")):
                     continue

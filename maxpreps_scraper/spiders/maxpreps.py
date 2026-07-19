@@ -209,6 +209,7 @@ class MaxPrepsSpider(scrapy.Spider):
     def parse_schedule(self, response, team, school):
         sport = team.get("sport")
         gender = team.get("gender")
+        level = team.get("level")
         season = f"{team.get('season','')} {team.get('year','')}".strip()
 
         # locate the schedule table by its header labels (class names are hashed)
@@ -241,6 +242,7 @@ class MaxPrepsSpider(scrapy.Spider):
                 state=school.get("state"),
                 sport=sport,
                 gender=gender,
+                level=level,
                 season=season,
                 schedule_url=response.url,
                 game_index=i,
