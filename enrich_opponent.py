@@ -10,8 +10,11 @@ link to that opponent's team page. This step follows the link and turns it into 
 
 How the name is resolved
 ------------------------
-1. **Scrape** the opponent's team page and read the last breadcrumb crumb, minus the sport --
-   "Saint Mary's High School Basketball" -> "Saint Mary's High School".
+1. **Scrape** the opponent's team page and read the breadcrumb crumb shaped
+   ``<School Name> <Sport>``, minus the sport -- "Star Valley High School Football" ->
+   "Star Valley High School". That crumb is the LAST one on a varsity page but the
+   second-to-last on a level page ("/football/freshman/" appends its own "Freshman" crumb),
+   so it is located by matching the sport, never by position.
 2. **Cross-reference** that against the teams CSV ``name`` column. On a match the teams row's
    ``original_name`` (the GoFan-verified name, written by ``enrich_gofan_scrapy.py``) wins, so
    a school is spelled identically in both CSVs. On no match the scraped name is kept as-is.
@@ -47,6 +50,7 @@ from scrapy.utils.project import get_project_settings
 # Reuse the proven name normalizer rather than re-implementing it.
 from enrich_gofan import normalize
 from maxpreps_scraper.nextdata import page_props
+from maxpreps_scraper.states import STATES
 
 NAME_COLUMN = "original_opponent_school_name"
 LOGO_COLUMN = "original_opponent_school_logo"
@@ -57,9 +61,35 @@ _GENDER = r"(?:boys|girls|coed|co-ed)"
 _PAREN_TAIL = re.compile(r"\s*\([^)]*\)\s*$")
 _WS = re.compile(r"\s+")
 
+# Team levels. MaxPreps appends one as its own final crumb on a level-specific team page
+# ("/football/freshman/" -> "... / Star Valley High School Football / Freshman"), and works it
+# into that page's <title>. A bare level is never a school name, so it must never be written.
+_LEVELS = frozenset({
+    "varsity", "jv", "junior varsity", "freshman", "freshmen", "fresh",
+    "sophomore", "b team", "c team", "middle school",
+})
+_LEVEL_TAIL = re.compile(
+    r"\s*\b(?:varsity|jv|junior\s+varsity|freshm[ae]n|sophomore|[bc]\s+team)\b\s*$", re.I
+)
+# A crumb like "WY Football" names the state's sport hub, not a school.
+_PLACE_WORDS = frozenset(
+    [code.lower() for code in STATES] + [name.lower() for name in STATES.values()]
+)
+
 
 def _clean(text):
     return _WS.sub(" ", (text or "")).strip()
+
+
+def _is_level(text):
+    """True for a bare team-level label ("Freshman", "JV") -- never a school name."""
+    return _clean(text).lower().strip(". ") in _LEVELS
+
+
+def strip_level(text):
+    """'Star Valley Braves Freshman' -> 'Star Valley Braves'."""
+    text = _clean(text)
+    return _clean(_LEVEL_TAIL.sub("", text)) or text
 
 
 def strip_sport(crumb, sport):
@@ -92,6 +122,17 @@ def state_of(url):
     """Opponent's state code from its URL's first path segment ('CA'), or ''."""
     parts = url_path_parts(url)
     return parts[0].upper() if parts else ""
+
+
+def is_school_url(url):
+    """True for a real school/team URL, i.e. ``/{state}/{city}/{school}/...``.
+
+    MaxPreps renders placeholder opponents ("N Non Varsity Opponent") as a link to
+    ``/utility/about_pseudo_schools.aspx``. That isn't a school, so there is nothing worth
+    fetching -- those rows keep the raw opponent text instead.
+    """
+    parts = url_path_parts(url)
+    return len(parts) >= 3 and parts[0].lower() in STATES
 
 
 # --------------------------------------------------------------------------- #
@@ -148,12 +189,16 @@ class NameIndex:
 # --------------------------------------------------------------------------- #
 # Page extraction
 # --------------------------------------------------------------------------- #
-def breadcrumb_last(response):
-    """The last breadcrumb crumb ("Saint Mary's High School Basketball"), or "".
+def breadcrumb_crumbs(response):
+    """Every breadcrumb crumb, in order, or [].
+
+    A level page yields
+    ``['Football', 'WY Football', 'Star Valley High School Football', 'Freshman']``.
 
     MaxPreps' CSS class names are hashed, so anchor on things that don't churn: the schema.org
     BreadcrumbList first, then an accessible <nav aria-label="breadcrumb">, then any ordered
-    list's final item.
+    list. The two DOM paths select ``li`` ELEMENTS and join each one's text separately --
+    flattening every text node into one list would smear the crumbs together.
     """
     for blob in response.xpath('//script[@type="application/ld+json"]/text()').getall():
         try:
@@ -163,50 +208,86 @@ def breadcrumb_last(response):
         for node in (data if isinstance(data, list) else [data]):
             if not isinstance(node, dict) or node.get("@type") != "BreadcrumbList":
                 continue
-            items = node.get("itemListElement") or []
-            if not items:
-                continue
-            last = items[-1] if isinstance(items[-1], dict) else {}
-            item = last.get("item")
-            name = last.get("name") or (item.get("name") if isinstance(item, dict) else None)
-            if name:
-                return _clean(name)
+            crumbs = []
+            for el in node.get("itemListElement") or []:
+                if not isinstance(el, dict):
+                    continue
+                item = el.get("item")
+                name = el.get("name") or (item.get("name") if isinstance(item, dict) else None)
+                if name:
+                    crumbs.append(_clean(name))
+            if crumbs:
+                return crumbs
 
     for xp in (
         # aria-label casing varies ("Breadcrumb"/"breadcrumb"); fold it before comparing.
-        '//nav[contains(translate(@aria-label, "BREADCUM", "breadcum"), "breadcrumb")]'
-        '//li[last()]//text()',
-        '//nav[contains(translate(@aria-label, "BREADCUM", "breadcum"), "breadcrumb")]'
-        '//text()',
-        '//ol[.//a]/li[last()]//text()',
+        '//nav[contains(translate(@aria-label, "BREADCUM", "breadcum"), "breadcrumb")]//li',
+        '//ol[.//a]/li',
     ):
-        parts = [_clean(t) for t in response.xpath(xp).getall()]
-        parts = [p for p in parts if p and p != "/"]
-        if parts:
-            return parts[-1]
+        crumbs = []
+        for li in response.xpath(xp):
+            text = _clean(" ".join(li.xpath(".//text()").getall()))
+            if text and text != "/":
+                crumbs.append(text)
+        if crumbs:
+            return crumbs
+    return []
+
+
+def school_from_crumbs(crumbs, sport):
+    """The ``<School Name> <Sport>`` crumb, minus the sport, or "".
+
+    Walks BACKWARDS and anchors on the sport rather than on position, because the school crumb
+    is last on a varsity page but second-to-last on a level-specific one:
+
+        varsity   ... / CA Basketball / Saint Mary's High School Basketball
+        freshman  ... / WY Football   / Star Valley High School Football / Freshman
+
+    Taking the last crumb outright would return "Freshman"/"JV". Anchoring on the sport handles
+    both layouts and naturally skips the site's own "<Sport>" and "<State> <Sport>" hub crumbs,
+    which strip down to nothing and to a state name respectively.
+    """
+    for crumb in reversed(crumbs):
+        name = strip_sport(crumb, sport)
+        if name == _clean(crumb):
+            continue  # didn't end with the sport -> a level crumb like "Freshman"
+        if not name or name.lower() in _PLACE_WORDS or _is_level(name):
+            continue  # the bare "Football" / "WY Football" hub crumbs
+        return name
     return ""
 
 
-def title_name(response):
-    """"Saint Mary's High School (Albany, CA)" -> "Saint Mary's High School"."""
+def title_name(response, sport=""):
+    """"Saint Mary's High School (Albany, CA)" -> "Saint Mary's High School".
+
+    Last resort, so it strips hard: a level page's title reads "Star Valley Braves Freshman
+    Football (Afton, WY)" and must not come back as anything ending in "Freshman".
+    """
     title = _clean(response.xpath("//title/text()").get())
-    return _clean(_PAREN_TAIL.sub("", title)) if title else ""
+    if not title:
+        return ""
+    return strip_level(strip_sport(_clean(_PAREN_TAIL.sub("", title)), sport))
 
 
 def school_name(response, sport):
-    """Best available school name for an opponent page, or ""."""
-    name = strip_sport(breadcrumb_last(response), sport)
+    """Best available school name for an opponent page, or "".
+
+    Every source is guarded by ``_is_level`` so a bare level word can never be written as a
+    school name -- if a source yields one, we fall through to the next rather than trust it.
+    """
+    name = school_from_crumbs(breadcrumb_crumbs(response), sport)
     if name:
         return name
 
     # Structured fallback: the Next.js blob the rest of this project reads.
     info = (page_props(response.text).get("schoolContext") or {}).get("schoolInfo") or {}
     for key in ("formattedNameWithoutState", "name", "formattedName"):
-        value = _clean(info.get(key))
-        if value:
-            return _clean(_PAREN_TAIL.sub("", value))
+        value = _clean(_PAREN_TAIL.sub("", _clean(info.get(key))))
+        if value and not _is_level(value):
+            return value
 
-    return title_name(response)
+    title = title_name(response, sport)
+    return "" if _is_level(title) else title
 
 
 def school_logo(response):
@@ -258,6 +339,8 @@ class OpponentSpider(scrapy.Spider):
             url = (row.get("opponent_url") or "").strip()
             if not url.lower().startswith(("http://", "https://")):
                 continue
+            if not is_school_url(url):
+                continue  # placeholder opponent (/utility/...) -> keep the raw opponent text
             entry = self.by_url.setdefault(url, {"sport": row.get("sport"), "rows": []})
             entry["rows"].append(i)
 
