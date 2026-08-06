@@ -35,6 +35,13 @@ GOFAN_TIMEOUT_SECONDS = 900
 # CSV is left intact and still usable.
 NFHS_TIMEOUT_SECONDS = 900
 
+# Hard cap on the opponent enrichment (seconds). This one fetches a MaxPreps page per DISTINCT
+# opponent -- roughly one per school in the crawl -- so it needs a bigger budget than the other
+# steps. On timeout the schedule CSV keeps the fallback columns written by the inline step
+# below, so it is still complete and usable. Anything raised here must also be reflected in
+# JOB_MAX_RUNTIME_SECONDS (api.py / render.yaml), which has to exceed the sum of every cap.
+OPPONENT_TIMEOUT_SECONDS = 1800
+
 
 def _copy_name_to_original_name(csv_path):
     """Write name → original_name for every row, creating the column if absent.
@@ -51,6 +58,37 @@ def _copy_name_to_original_name(csv_path):
     out_fields = fieldnames + ([] if "original_name" in fieldnames else ["original_name"])
     for row in rows:
         row["original_name"] = (row.get("name") or "").strip()
+
+    tmp = csv_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=out_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, csv_path)
+
+
+def _prefill_opponent_columns(csv_path):
+    """Seed the two opponent columns from the schedule's own data, creating them if absent.
+
+    Guarantees the columns exist on every row before the (network-bound, timeout-capped)
+    enrichment runs -- without this a timed-out enrichment would leave the API serving a
+    schedule CSV with no such columns at all. ``enrich_opponent.py`` overwrites these with the
+    scraped school name and logo for every opponent whose page it manages to read.
+
+    Idempotent: safe to call on a CSV that already has the columns (e.g. a re-run).
+    """
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    out_fields = fieldnames + [
+        c for c in ("original_opponent_school_name", "original_opponent_school_logo")
+        if c not in fieldnames
+    ]
+    for row in rows:
+        row["original_opponent_school_name"] = (row.get("opponent") or "").strip()
+        row["original_opponent_school_logo"] = ""
 
     tmp = csv_path + ".tmp"
     with open(tmp, "w", newline="", encoding="utf-8") as fh:
@@ -82,10 +120,10 @@ def main():
         output_dir=output_dir,
     )
 
+    here = os.path.dirname(os.path.abspath(__file__))
     teams_csv = os.path.join(output_dir, "max_prep_School.csv")
+    schedule_csv = os.path.join(output_dir, "max_prep_schedule.csv")
     if os.path.exists(teams_csv):
-        here = os.path.dirname(os.path.abspath(__file__))
-
         # Second phase: copy the MaxPreps "name" column into "original_name".
         # This gives the GoFan step a search value and acts as the fallback for rows
         # where no GoFan match is found. Done inline (no subprocess) -- it's a plain
@@ -122,6 +160,30 @@ def main():
             )
         except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
             print(f"worker: nfhs enrichment skipped/failed: {exc!r}", file=sys.stderr)
+
+    # Fifth phase: the only step that rewrites the SCHEDULE csv. Resolves each game's opponent
+    # into "original_opponent_school_name" + "original_opponent_school_logo". Runs last because
+    # it cross-references the teams CSV's "original_name", which isn't final until GoFan (third
+    # phase) has run.
+    if os.path.exists(schedule_csv) and os.path.exists(teams_csv):
+        # 5a, inline: seed both columns from the schedule's own opponent text so they exist
+        # even if 5b is killed by its timeout.
+        try:
+            _prefill_opponent_columns(schedule_csv)
+        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
+            print(f"worker: opponent column prefill failed: {exc!r}", file=sys.stderr)
+
+        # 5b, own subprocess (Scrapy reactor): fetch each distinct opponent page for its real
+        # school name + logo, cross-referencing the teams CSV for the name.
+        try:
+            subprocess.run(
+                [sys.executable, "enrich_opponent.py", schedule_csv, teams_csv],
+                cwd=here,
+                timeout=OPPONENT_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
+            print(f"worker: opponent enrichment skipped/failed: {exc!r}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -14,9 +14,11 @@ services:
       # Leave as "*" for the first deploy, then tighten to the Vercel URL.
       - key: FRONTEND_ORIGIN
         value: "*"
-      # Must be 1 while MEMUSAGE_LIMIT_MB is high: the cap is per-process, so two crawls
-      # at 1600 MB would exceed the 2 GB box and cause an ungraceful OS OOM kill. To run
-      # 2 concurrently, drop MEMUSAGE_LIMIT_MB to ~800 first.
+      # WARNING: this is 2 while MEMUSAGE_LIMIT_MB is 1600, and that cap is PER PROCESS --
+      # two crawls that both approach it would exceed the 2 GB box and trigger an ungraceful
+      # OS OOM kill instead of the graceful self-close. In practice JOBDIR keeps a crawl at
+      # ~55-70 MB so this rarely bites, but to make 2 concurrent jobs safe by construction,
+      # drop MEMUSAGE_LIMIT_MB to ~800 (or set this back to 1).
       - key: MAX_CONCURRENT_JOBS
         value: "2"
       # Graceful memory cap per crawl (MB). The crawl closes itself and flushes partial
@@ -34,8 +36,8 @@ services:
       # box bounds what a live web crawl can realistically finish.
       - key: CLOSESPIDER_TIMEOUT
         value: "14400"
-      # Last-resort watchdog (s); must exceed CLOSESPIDER_TIMEOUT + GoFan 900 + NFHS 900
-      # (= 16200) so a legitimate long crawl self-closes gracefully before the watchdog
-      # terminates it mid-run. 18000 leaves ~30 min of margin.
+      # Last-resort watchdog (s); must exceed CLOSESPIDER_TIMEOUT + GoFan 900 + NFHS 900 +
+      # opponent 1800 (= 18000) so a legitimate long crawl self-closes gracefully before the
+      # watchdog terminates it mid-run. 19800 leaves ~30 min of margin.
       - key: JOB_MAX_RUNTIME_SECONDS
-        value: "18000"
+        value: "19800"

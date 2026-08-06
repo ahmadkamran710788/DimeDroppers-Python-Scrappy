@@ -105,7 +105,7 @@ address, zip_code, phone, color1-3, mascot_url, league_name, association_name,
 governing_body_name/url, website, facebook, instagram, twitter, youtube,
 sports, sports_count, discovered_via`
 
-**`games`** columns: `school_id, school_name, state, sport, gender, season,
+**`games`** columns: `school_id, school_name, state, sport, gender, season, level,
 game_index, date, home_away, opponent, opponent_url, result, score, game_info,
 schedule_url`
 
@@ -166,6 +166,33 @@ uvicorn api:app --reload          # http://localhost:8000
 | `GET /states` | `[{ code, name }]` for all 50 states + DC. |
 | `GET /sports` | Common sport labels for a dropdown. |
 | `GET /health` | Health check for Render. |
+
+### Extra columns the API's CSVs carry
+
+After the crawl, `worker.py` runs a chain of best-effort enrichment steps that append columns
+the canonical CSV/SQLite output does **not** have. Each writes atomically and swallows its own
+failures, so a job always returns usable data even if a step times out.
+
+`teams.csv` (on top of the `schools` columns above):
+
+| Column | Source |
+|---|---|
+| `original_name` | The school's name as GoFan spells it (`enrich_gofan_scrapy.py`), falling back to the MaxPreps `name` when there's no GoFan match |
+| `go_fan_ticket_url` | `https://gofan.co/app/school/{huddleId}`, matched on state + city and verified to return HTTP 200 |
+| `nfhs_url` | `https://www.nfhsnetwork.com/schools/{slug}`, matched against NFHS's cached catalog (`enrich_nfhs.py`) |
+
+`schedule.csv` (on top of the `games` columns above), both from `enrich_opponent.py`:
+
+| Column | Source |
+|---|---|
+| `original_opponent_school_name` | The opponent's real school name, read from the breadcrumb on its MaxPreps page minus the sport. Cross-referenced against the teams CSV so a school that appears in both files gets the same `original_name` spelling in each; falls back to the scraped name, then to the raw `opponent` text |
+| `original_opponent_school_logo` | The opponent school's logo URL from its MaxPreps page |
+
+Both opponent columns can also be (re)built by hand against an existing pair of CSVs:
+
+```bash
+python enrich_opponent.py output/max_prep_schedule.csv output/max_prep_School.csv
+```
 
 ```bash
 # quick smoke test (Wyoming + Football is small/fast)

@@ -42,9 +42,12 @@ MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
 # Wall-clock backstop: a job 'running' longer than this is treated as failed, so a
 # crashed/hung crawl can never pin a concurrency slot forever. This is a LAST RESORT --
 # the crawl bounds itself first (settings.CLOSESPIDER_TIMEOUT) and so does each enrichment
-# step (worker.py GOFAN/NFHS timeouts). Keep this above their sum so a legitimate long job
-# is never killed mid-run: CLOSESPIDER_TIMEOUT (1800) + GoFan (900) + NFHS (900) = 3600.
-JOB_MAX_RUNTIME_SECONDS = int(os.environ.get("JOB_MAX_RUNTIME_SECONDS", "3900"))
+# step (worker.py GOFAN/NFHS/OPPONENT timeouts). Keep this above their sum so a legitimate
+# long job is never killed mid-run. The deployed values (render.yaml) are
+# CLOSESPIDER_TIMEOUT 14400 + GoFan 900 + NFHS 900 + opponent 1800 = 18000, against a
+# JOB_MAX_RUNTIME_SECONDS of 19800. The default below matches the un-overridden
+# settings.py CLOSESPIDER_TIMEOUT (1800) + the same three enrichment caps = 5400.
+JOB_MAX_RUNTIME_SECONDS = int(os.environ.get("JOB_MAX_RUNTIME_SECONDS", "5700"))
 # Common high-school sports as MaxPreps labels them (for the frontend dropdown).
 COMMON_SPORTS = [
     "Football", "Basketball", "Baseball", "Softball", "Soccer", "Volleyball",
