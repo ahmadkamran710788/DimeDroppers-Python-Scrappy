@@ -454,7 +454,7 @@ class HarvestSpider(scrapy.Spider):
 
     def parse(self, response, root, sport):
         row = school_row(page_props(response.text), url=root,
-                         discovered_via="opponent:schedule")
+                         discovered_via="opponent:schedule", html=response.text)
         if row:
             name, logo = _clean(row["name"]), _clean(row["mascot_url"])
             sid = (row["school_id"] or "").strip()

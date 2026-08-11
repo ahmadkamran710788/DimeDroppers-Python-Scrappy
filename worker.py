@@ -73,6 +73,59 @@ def _copy_name_to_original_name(csv_path):
     os.replace(tmp, csv_path)
 
 
+# Where MaxPreps publishes a partner link itself -> which enrichment column it may fill.
+# Strictly a FALLBACK: the catalog-matched value always wins when it is non-empty.
+MAXPREPS_LINK_FALLBACKS = (
+    ("maxpreps_gofan_url", "go_fan_ticket_url"),
+    ("maxpreps_nfhs_url", "nfhs_url"),
+)
+
+
+def _fill_links_from_maxpreps(csv_path):
+    """Fill blank go_fan_ticket_url / nfhs_url from the links MaxPreps published.
+
+    The crawler records the GoFan / NFHS links present on a school's own MaxPreps page
+    (``maxpreps_scraper/schoolinfo.py``). Those cost no extra requests -- the page was
+    already fetched and parsed -- and they cover schools whose GoFan/NFHS catalog match
+    failed on a name or city mismatch.
+
+    Fill only, never overwrite, and each column decided independently: a value the GoFan
+    step actually verified returns HTTP 200 is strictly better evidence than an unverified
+    link, so it is kept. If only one of the two columns is empty, only that one is filled.
+
+    Runs AFTER phases 3 and 4 because both of those set their column unconditionally --
+    to "" when they find no match -- so anything written earlier would be clobbered.
+    Doing it here means neither enrichment script needs modifying.
+
+    Idempotent, and a no-op on a CSV that predates the source columns.
+    """
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    pairs = [(src, dst) for src, dst in MAXPREPS_LINK_FALLBACKS if src in fieldnames]
+    if not pairs:
+        return  # nothing to fill from (e.g. a CSV from an older crawl)
+
+    out_fields = fieldnames + [d for _s, d in pairs if d not in fieldnames]
+    filled = {dst: 0 for _src, dst in pairs}
+    for row in rows:
+        for src, dst in pairs:
+            if not (row.get(dst) or "").strip() and (row.get(src) or "").strip():
+                row[dst] = row[src].strip()
+                filled[dst] += 1
+
+    tmp = csv_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=out_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, csv_path)
+    print("worker: filled from MaxPreps links -> "
+          + ", ".join(f"{dst} +{n}" for dst, n in filled.items()))
+
+
 def _prefill_opponent_columns(csv_path):
     """Seed the two opponent columns from the schedule's own data, creating them if absent.
 
@@ -179,6 +232,15 @@ def main():
         # Matches original_name (state + city gated) against NFHS's cached catalog.
         _step("nfhs enrichment", ["enrich_nfhs.py", teams_csv],
               NFHS_TIMEOUT_SECONDS, here)
+
+        # Phase 4.5: for schools those two catalogs couldn't match, fall back to the
+        # GoFan/NFHS links MaxPreps published on the school's own page (captured during
+        # the crawl, so no extra requests). Fills blanks only -- a verified catalog match
+        # is never overwritten -- which is why it runs after them rather than before.
+        try:
+            _fill_links_from_maxpreps(teams_csv)
+        except Exception as exc:  # noqa: BLE001 - never fail the job on enrichment
+            print(f"worker: maxpreps link fill failed: {exc!r}", file=sys.stderr)
 
     # Phase 5: the only step that rewrites the SCHEDULE csv. Resolves each game's opponent
     # into "original_opponent_school_name" + "original_opponent_school_logo". Runs last

@@ -44,6 +44,12 @@ class SchoolItem(scrapy.Item):
     twitter = scrapy.Field()
     youtube = scrapy.Field()
 
+    # partner links as published by MaxPreps (GoFan tickets / NFHS Network).
+    # Distinct from the go_fan_ticket_url / nfhs_url columns the enrichment chain adds
+    # by catalog matching -- see worker.py phase 4.5.
+    maxpreps_gofan_url = scrapy.Field()
+    maxpreps_nfhs_url = scrapy.Field()
+
     # sports offered (semicolon-joined in CSV, list in JSON)
     sports = scrapy.Field()
     sports_count = scrapy.Field()

@@ -22,6 +22,7 @@ SCHOOL_FIELDS = [
     "color1", "color2", "color3", "mascot_url",
     "league_name", "association_name", "governing_body_name", "governing_body_url",
     "website", "facebook", "instagram", "twitter", "youtube",
+    "maxpreps_gofan_url", "maxpreps_nfhs_url",
     "sports", "sports_count", "discovered_via",
 ]
 GAME_FIELDS = [

@@ -103,7 +103,12 @@ Written to `output/` (override with `-s OUTPUT_DIR=...`):
 **`schools`** columns: `school_id, name, city, state, state_name, url, mascot,
 address, zip_code, phone, color1-3, mascot_url, league_name, association_name,
 governing_body_name/url, website, facebook, instagram, twitter, youtube,
-sports, sports_count, discovered_via`
+maxpreps_gofan_url, maxpreps_nfhs_url, sports, sports_count, discovered_via`
+
+`maxpreps_gofan_url` / `maxpreps_nfhs_url` are the GoFan ticket and NFHS Network
+links **MaxPreps itself publishes** on the school's page, when it has them. They cost
+no extra requests (the page is already fetched and parsed) and are empty when MaxPreps
+links only to the partners' home pages rather than to that school.
 
 **`games`** columns: `school_id, school_name, state, sport, gender, season, level,
 game_index, date, home_away, opponent, opponent_url, result, score, game_info,
@@ -178,8 +183,21 @@ failures, so a job always returns usable data even if a step times out.
 | Column | Source |
 |---|---|
 | `original_name` | The school's name as GoFan spells it (`enrich_gofan_scrapy.py`), falling back to the MaxPreps `name` when there's no GoFan match |
-| `go_fan_ticket_url` | `https://gofan.co/app/school/{huddleId}`, matched on state + city and verified to return HTTP 200 |
-| `nfhs_url` | `https://www.nfhsnetwork.com/schools/{slug}`, matched against NFHS's cached catalog (`enrich_nfhs.py`) |
+| `go_fan_ticket_url` | `https://gofan.co/app/school/{huddleId}`, matched on state + city and verified to return HTTP 200. **Falls back to `maxpreps_gofan_url`** when that match finds nothing |
+| `nfhs_url` | `https://www.nfhsnetwork.com/schools/{slug}`, matched against NFHS's cached catalog (`enrich_nfhs.py`). **Falls back to `maxpreps_nfhs_url`** when that match finds nothing |
+
+The fallback fills blanks only, and each column is decided independently — a link the
+GoFan step actually verified returns HTTP 200 is never replaced by MaxPreps' unverified
+one. If only one of the two came back empty, only that one is filled. The catalog-matching
+scripts themselves are untouched by this; the fill is a separate step in `worker.py` that
+runs after them.
+
+To see which links MaxPreps publishes for a given school (and check they aren't just its
+site-wide nav links to those partners):
+
+```bash
+python scripts/probe_partner_links.py https://www.maxpreps.com/ca/stockton/lincoln-trojans/
+```
 
 `schedule.csv` (on top of the `games` columns above), both from `enrich_opponent.py`:
 

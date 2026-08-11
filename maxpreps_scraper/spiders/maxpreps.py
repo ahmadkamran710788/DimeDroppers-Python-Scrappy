@@ -138,7 +138,8 @@ class MaxPrepsSpider(scrapy.Spider):
         # opponents this crawl never reached; one mapping, so the two can't drift.
         if school_id and school_id not in self._seen_schools:
             self._seen_schools.add(school_id)
-            row = school_row(pp, url=response.url, discovered_via=discovered_via)
+            row = school_row(pp, url=response.url, discovered_via=discovered_via,
+                             html=response.text)
             if row:
                 yield SchoolItem(**row)
 

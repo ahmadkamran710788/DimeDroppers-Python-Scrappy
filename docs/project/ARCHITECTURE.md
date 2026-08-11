@@ -5,9 +5,9 @@
 > actually works, why it is shaped this way, and what will bite you**.
 > Read this first, then only the files you need.
 
-Last verified against commit `d65b551` **plus uncommitted work** on the two tester
-follow-ups: breadth-first scheduling (§4.3) and opponent schools in the teams CSV (§7.2).
-~3,500 LOC, 22 Python files, no tests, no CI.
+Last verified against commit `4cd7f4c` — breadth-first scheduling (§4.3) and opponent
+schools in the teams CSV (§7.2) are in — **plus uncommitted work** on MaxPreps' own
+GoFan/NFHS links (§7.1b). ~3,840 LOC, 23 Python files, no tests, no CI.
 
 ---
 
@@ -34,7 +34,7 @@ produce two transient CSVs per job.
 | `pipelines.py` | `MultiFormatPipeline` — CSV + SQLite live, JSON on close |
 | `export.py` | `SCHOOL_FIELDS` / `GAME_FIELDS` (the column contract) + DB→CSV/JSON rebuild |
 | `nextdata.py` | `__NEXT_DATA__` blob extractor — `page_props(html)` |
-| `schoolinfo.py` | `school_row(page_props, url, discovered_via)` — the **one** `pageProps` → `SCHOOL_FIELDS` mapper. Shared by the spider and the opponent harvest so they can't drift |
+| `schoolinfo.py` | `school_row(page_props, url, discovered_via, html)` — the **one** `pageProps` → `SCHOOL_FIELDS` mapper. Shared by the spider and the opponent harvest so they can't drift. Also `partner_links()`, the GoFan/NFHS link scanner (§7.1b) |
 | `states.py` | 50 states + DC, code→name |
 | `settings.py` | Politeness, throttling, memory/time guards |
 | **Entry points** | |
@@ -283,6 +283,7 @@ Runs after the crawl, **strictly ordered** — each step feeds the next.
 | **2.5** | **`enrich_opponent.py harvest`** | subprocess | **appends a teams row per opponent school; writes `opponents.json`** |
 | 3 | `enrich_gofan_scrapy.py` | subprocess | `go_fan_ticket_url`; **overwrites** `original_name` with GoFan's spelling |
 | 4 | `enrich_nfhs.py` | subprocess | `nfhs_url` |
+| **4.5** | **`_fill_links_from_maxpreps`** | inline | **fills blank `go_fan_ticket_url` / `nfhs_url` from `maxpreps_*_url`** |
 | 5a | `_prefill_opponent_columns` | inline | seeds both opponent columns from raw `opponent` text |
 | 5b | `enrich_opponent.py resolve` | subprocess | `original_opponent_school_name`, `original_opponent_school_logo` |
 
@@ -300,6 +301,38 @@ missing from the CSV header entirely. (Steps 3 and 4 lack this guard — see §9
 
 `teams.csv`: `original_name`, `go_fan_ticket_url`, `nfhs_url`
 `schedule.csv`: `original_opponent_school_name`, `original_opponent_school_logo`
+
+(`maxpreps_gofan_url` / `maxpreps_nfhs_url` are **not** in this list — they are canonical
+`SCHOOL_FIELDS`, written by the crawl itself, so they appear in `schools.csv` and SQLite too.)
+
+### 7.1b Partner links — MaxPreps' own GoFan / NFHS links (phase 4.5)
+
+`go_fan_ticket_url` and `nfhs_url` are resolved by **catalog matching**, which fails on any
+name or city mismatch and then writes `""`. Where MaxPreps publishes a partner link on the
+school's own page, that is first-party evidence we already have in hand — the page was
+fetched and parsed by `parse_school` regardless — so it costs zero extra requests.
+
+`schoolinfo.partner_links()` extracts them. Two properties are load-bearing:
+
+- **Key-agnostic.** It scans *every* URL in the `pageProps` blob (breadth-first, depth- and
+  node-capped) rather than reading a guessed key. MaxPreps' Next.js payload shape is not
+  contractual and has moved before; a scan survives a rename.
+- **Site chrome is rejected.** MaxPreps is a CBS/PlayOnSports property and links both
+  partners from its nav/footer. Accepting any `gofan.co` URL would stamp the same useless
+  link onto every row — a column that looks populated but identifies nothing. Only paths
+  naming a specific school or event are accepted (`PARTNERS[*]["accept"]`), school-scoped
+  ranked above event-scoped.
+
+**Phase 4.5 fills blanks only, per column, independently.** A catalog match that was
+verified to return HTTP 200 is strictly better evidence than an unverified link, so it is
+never overwritten. It runs *after* phases 3 and 4 because both set their column
+unconditionally (to `""` on no match, `enrich_nfhs.py:295` / `enrich_gofan_scrapy.py:98`) —
+anything written earlier would be clobbered. Doing it as its own step is what keeps
+**both enrichment scripts unmodified**. Inline, so the timeout ladder is unchanged.
+
+If the columns come back empty or suspiciously uniform, `scripts/probe_partner_links.py`
+prints every gofan/nfhs URL on a school page with its JSON path and an ACCEPT/reject
+verdict, and warns when a value is identical across pages (i.e. it is nav chrome).
 
 ### 7.2 Why `enrich_opponent.py` is split in two
 
@@ -507,8 +540,13 @@ distinct candidates — but still a serial stall inside the 900s budget on a big
 3. **Every enriched column must exist on every row**, even when its step is killed.
    Prefill inline first (§9.1 is the outstanding violation).
 4. **Enrichment order is fixed**: `original_name` copy → opponent **harvest** → GoFan →
-   NFHS → opponent **resolve** (§7). Harvest must precede GoFan/NFHS so the rows it adds
-   get enriched; resolve must follow GoFan because it matches on the final `original_name`.
+   NFHS → **MaxPreps link fill** → opponent **resolve** (§7). Harvest must precede
+   GoFan/NFHS so the rows it adds get enriched; the link fill must follow them because they
+   write their column unconditionally; resolve must follow GoFan because it matches on the
+   final `original_name`.
+4b. **A catalog-matched link is never overwritten** (§7.1b). `maxpreps_*_url` only ever
+    fills a blank `go_fan_ticket_url` / `nfhs_url`, each decided independently. And
+    `enrich_gofan_scrapy.py` / `enrich_nfhs.py` stay out of it — the fill is its own step.
 5. **Watchdog > sum of inner caps** (§6.1), mirrored in `api.py` *and* `render.yaml`.
 6. **Matcher state scoping stays structural** — candidates drawn from `by_state[st]`.
 7. **The API path never writes canonical output.** Keep `ITEM_PIPELINES` swapped.
@@ -568,6 +606,9 @@ python enrich_opponent.py         output/max_prep_schedule.csv output/max_prep_S
 python enrich_opponent.py harvest output/max_prep_schedule.csv output/max_prep_School.csv
 python enrich_opponent.py resolve output/max_prep_schedule.csv output/max_prep_School.csv
 
+# --- which GoFan/NFHS links does MaxPreps publish? (diagnostic, §7.1b) ---
+python scripts/probe_partner_links.py https://www.maxpreps.com/ca/stockton/lincoln-trojans/
+
 # --- rebuild CSV/JSON from the canonical SQLite ---
 python -m maxpreps_scraper.export output
 ```
@@ -600,6 +641,7 @@ best done locally with `backfill_all.py`, which is fully uncapped.
 | Add a scraped school/game field | `items.py` → `export.py` field lists → `spiders/maxpreps.py` |
 | Add an enrichment column | `worker.py` (prefill + subprocess), new `enrich_*.py`, §10 rules 2–4 |
 | Change matching accuracy | `enrich_gofan.py::Matcher` (shared shape with `enrich_nfhs.py`) |
+| Empty / identical `maxpreps_*_url` | `scripts/probe_partner_links.py` first, then `schoolinfo.PARTNERS` (§7.1b) |
 | Fix an opponent name/logo bug | `enrich_opponent.py` — `resolve()` first, then `NameIndex` / `school_from_crumbs` |
 | Fix a missing opponent school row | `enrich_opponent.py` — `HarvestSpider` / `opponent_roots()`, §7.2 |
 | Change API shape | `api.py`; note the `FILENAMES` coupling to `MaxPrepTwoFilePipeline` |
