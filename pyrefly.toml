@@ -1,0 +1,19 @@
+# Pin the interpreter so Pyrefly reads THIS project's site-packages.
+# Without this it queries `python3` off PATH; the IDE launches without .venv on PATH
+# and lands on system Python 3.9, making scrapy/fastapi/itemadapter unresolvable and
+# painting every file red.
+python-interpreter-path = ".venv/bin/python"
+python-version = "3.9"
+
+# Keep the strictness the IDE already applied before this file existed. Adding a
+# pyrefly.toml otherwise switches the preset off `basic` and surfaces ~15 pre-existing
+# `Optional` type errors in the enrich_* spiders (csv_path can be None). Those are worth
+# fixing on their own; bump this to "strict" once they are.
+preset = "basic"
+
+project-excludes = [
+  "**/.venv/**",
+  "**/output*/**",
+  "**/httpcache/**",
+  "**/__pycache__/**",
+]

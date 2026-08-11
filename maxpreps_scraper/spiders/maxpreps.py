@@ -94,10 +94,11 @@ class MaxPrepsSpider(scrapy.Spider):
     def parse_directory(self, response, state_code):
         pp = page_props(response.text)
         groupings = pp.get("groupings") or []
-        self.logger.info(
-            "Directory %s: %d schools (capped at 200 by the site)",
-            state_code, len(groupings),
-        )
+        # MaxPreps truncates this list at ~200 for large states (small states return their
+        # true count), so log the raw number: it is the first thing to check when a state
+        # comes back short. Compare it against the directory:<state> row count in the CSV --
+        # if the CSV has far fewer, the crawl was truncated, not the directory.
+        self.logger.info("Directory %s: %d schools listed", state_code, len(groupings))
         for g in groupings:
             url = g.get("canonicalUrl")
             if url:
@@ -206,17 +207,45 @@ class MaxPrepsSpider(scrapy.Spider):
     # ------------------------------------------------------------------ #
     # 3. schedule pages
     # ------------------------------------------------------------------ #
-    def parse_schedule(self, response, team, school):
-        sport = team.get("sport")
-        gender = team.get("gender")
-        level = team.get("level")
-        season = f"{team.get('season','')} {team.get('year','')}".strip()
+    def parse_schedule(self, response, team, school, discovery_only=False):
+        """Emit this team's games, then expand the crawl via its opponents.
 
+        ``discovery_only`` fetches the page purely to harvest its opponent links: the
+        games are NOT emitted. ``FilteredMaxPrepsSpider`` uses it to keep school
+        discovery independent of its sport filter -- opponent links are one of the two
+        vectors that reach past the 200-schools-per-state directory cap, so narrowing
+        which schedules get fetched would otherwise narrow which schools can be found
+        at all. Defaults to False, so the canonical crawl is unaffected.
+        """
         # locate the schedule table by its header labels (class names are hashed)
         table = response.xpath(
             '//table[.//th[contains(., "Opponent")]'
             ' and .//th[contains(., "Date")]][1]'
         )
+
+        if not discovery_only:
+            yield from self._parse_games(response, table, team, school)
+
+        # graph expansion via opponents -- runs for discovery-only fetches too, since
+        # harvesting these links is the entire point of them.
+        if self.discover:
+            for href in table.xpath('.//tbody//a/@href').getall():
+                url = response.urljoin(href)
+                # opponent links point at a team page; trim to the school root
+                parts = url.replace(BASE, "").strip("/").split("/")
+                if len(parts) >= 3:
+                    school_root = f"{BASE}/{parts[0]}/{parts[1]}/{parts[2]}/"
+                    req = self._maybe_follow_school(school_root, discovered_via="opponent")
+                    if req:
+                        yield req
+
+    def _parse_games(self, response, table, team, school):
+        """One ``ScheduleGameItem`` per row of an already-located schedule table."""
+        sport = team.get("sport")
+        gender = team.get("gender")
+        level = team.get("level")
+        season = f"{team.get('season','')} {team.get('year','')}".strip()
+
         rows = table.xpath('.//tbody/tr | .//tr[td]')
         for i, row in enumerate(rows):
             cells = row.xpath('./td')
@@ -254,18 +283,6 @@ class MaxPrepsSpider(scrapy.Spider):
                 score=score,
                 game_info=game_info,
             )
-
-        # graph expansion via opponents
-        if self.discover:
-            for href in table.xpath('.//tbody//a/@href').getall():
-                url = response.urljoin(href)
-                # opponent links point at a team page; trim to the school root
-                parts = url.replace(BASE, "").strip("/").split("/")
-                if len(parts) >= 3:
-                    school_root = f"{BASE}/{parts[0]}/{parts[1]}/{parts[2]}/"
-                    req = self._maybe_follow_school(school_root, discovered_via="opponent")
-                    if req:
-                        yield req
 
     # ------------------------------------------------------------------ #
     # helpers

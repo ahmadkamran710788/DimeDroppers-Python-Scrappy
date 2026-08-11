@@ -78,6 +78,25 @@ MEMUSAGE_WARNING_MB = int(os.environ.get("MEMUSAGE_WARNING_MB", "1300"))
 # terminated by api.py's watchdog. 0 disables (rely on the memory guard only).
 CLOSESPIDER_TIMEOUT = int(os.environ.get("CLOSESPIDER_TIMEOUT", "1800"))
 
+# --- crawl order: BREADTH-FIRST (do not change without reading this) -------- #
+# The <=200 schools in each state's directory are the authoritative seed list; the
+# nearbySchools + opponent graph walk is effectively unbounded. Scrapy's DEFAULTS are
+# LIFO (PickleLifoDiskQueue / LifoMemoryQueue, DEPTH_PRIORITY=0) = depth-first, which
+# dives into that graph and leaves most directory seeds sitting in the queue. Any
+# truncation -- CLOSESPIDER_TIMEOUT below, MEMUSAGE_LIMIT_MB above, or api.py's
+# JOB_MAX_RUNTIME_SECONDS watchdog -- then drops the seeds FIRST, i.e. it loses the
+# best schools and keeps the speculative ones. That is exactly how a FL run fell from
+# ~190 directory schools to 9.
+#
+# Breadth-first instead: depth 1 = directory school pages, depth 2 = schedules +
+# nearbySchools, depth 3+ = opponents. Every directory seed is now crawled before any
+# discovered school, so a truncated crawl degrades by losing graph-discovered extras
+# rather than the guaranteed list. JOBDIR spills the (wider) BFS frontier to disk, so
+# this costs disk, not RAM.
+DEPTH_PRIORITY = 1
+SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
+SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
+
 # --- misc ------------------------------------------------------------------ #
 LOG_LEVEL = "INFO"
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"

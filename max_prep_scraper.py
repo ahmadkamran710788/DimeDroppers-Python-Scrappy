@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 """Pull MaxPreps schools + schedules for specific SPORTS in specific STATES.
 
-A focused, standalone launcher around the existing ``MaxPrepsSpider``. You give it
-one or more states and one or more sports; it crawls those states, keeps only the
-schools that offer at least one of the requested sports, and pulls just those sports'
-schedules. Results go to two dedicated CSVs:
+A focused, standalone launcher around the existing ``MaxPrepsSpider``. You give it one or
+more states and one or more sports; it crawls those states, writes EVERY school it finds,
+and pulls schedules for just the requested sports.
+
+The sport filter applies to SCHEDULES ONLY. It never narrows the school list, and it never
+narrows which schools can be *discovered* either -- see DISCOVERY_SCHEDULES_PER_SCHOOL
+below. Results go to two dedicated CSVs:
 
     output/max_prep_School.csv      one row per matching school
     output/max_prep_schedule.csv    one row per game (only the requested sports)
@@ -33,37 +36,98 @@ from maxpreps_scraper.spiders.maxpreps import MaxPrepsSpider
 
 LIST_FIELDS = {"sports"}  # lists -> "a; b; c" in the flat CSV (same as the main pipeline)
 
+# How many EXTRA schedule pages may be fetched per school purely to discover new schools,
+# when a sport filter is active. These emit no games.
+#
+# Why this exists: opponent links on schedule pages are one of the two vectors that reach
+# past MaxPreps' 200-schools-per-state directory cap (nearbySchools is the other). Dropping
+# off-sport schedule requests therefore used to shrink the set of schools that could ever be
+# FOUND -- a school that doesn't play the requested sport never appears as an opponent on it,
+# so it was reachable only via the <=200 directory seeds or a nearbySchools link. That is the
+# "schools are getting missed when a sport is selected" bug.
+#
+# Bounded on purpose: a school offers many sport-seasons, so fetching them all would multiply
+# the crawl's page count and, on a time-capped run (CLOSESPIDER_TIMEOUT), would find FEWER
+# schools rather than more. Raise it with `-a discovery_schedules=N`, or "all" for an uncapped
+# local/backfill run where wall-clock isn't the binding constraint.
+DISCOVERY_SCHEDULES_PER_SCHOOL = 2
+
+# Near-universal sports make the best discovery seeds -- their schedules touch the most
+# distinct opponents. Preferred when choosing which off-sport schedules to spend the budget on.
+CONNECTOR_SPORTS = ("basketball", "volleyball", "soccer", "baseball", "softball", "cross country")
+
 
 # --------------------------------------------------------------------------- #
 # Spider: existing crawler + a sport filter (sport names matched exactly,
 # case-insensitively, so "Football" never picks up "Flag Football").
+#
+# The sport filter applies to SCHEDULES ONLY. It never narrows the school list, and
+# never narrows which schools can be discovered (see DISCOVERY_SCHEDULES_PER_SCHOOL).
 # --------------------------------------------------------------------------- #
 class FilteredMaxPrepsSpider(MaxPrepsSpider):
     name = "maxpreps_filtered"
 
-    def __init__(self, sports=None, *args, **kwargs):
+    def __init__(self, sports=None, discovery_schedules=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.target_sports = (
             None if not sports
             else {s.strip().lower() for s in str(sports).split(",") if s.strip()}
         )
+        self.discovery_schedules = self._parse_budget(discovery_schedules)
+
+    @staticmethod
+    def _parse_budget(value):
+        """Per-school discovery-fetch budget. ``None`` means unlimited ("all")."""
+        if value in (None, ""):
+            return DISCOVERY_SCHEDULES_PER_SCHOOL
+        if str(value).strip().lower() == "all":
+            return None
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return DISCOVERY_SCHEDULES_PER_SCHOOL
 
     def _season_matches(self, sport):
         return bool(self.target_sports) and (sport or "").strip().lower() in self.target_sports
 
     def parse_school(self, response, discovered_via):
-        # Reuse the parent's logic entirely and just filter what it yields:
+        # Reuse the parent's logic entirely and just re-route what it yields:
         #   - keep EVERY school (the teams list is never narrowed by the sport filter),
-        #   - drop schedule requests for non-requested sports,
-        #   - let discovery requests through so coverage still expands.
+        #   - yield schedule requests for the requested sports as-is (these produce games),
+        #   - turn a bounded number of the REMAINING schedule requests into discovery-only
+        #     fetches rather than dropping them, so school coverage stays independent of
+        #     the sport filter,
+        #   - let nearby-school discovery requests through untouched.
+        off_sport = []
         for out in super().parse_school(response, discovered_via=discovered_via):
             if isinstance(out, scrapy.Request) and out.callback == self.parse_schedule:
                 team = out.cb_kwargs.get("team") or {}
-                if self.target_sports and not self._season_matches(team.get("sport")):
-                    continue
-                yield out
+                if not self.target_sports or self._season_matches(team.get("sport")):
+                    yield out
+                else:
+                    off_sport.append(out)
             else:
                 yield out
+
+        # Schedules for sports we weren't asked about: fetch a few anyway, purely to harvest
+        # their opponent links. parse_schedule emits no games for these, so schedule.csv is
+        # byte-for-byte unaffected -- only teams.csv grows.
+        if not (self.discover and off_sport):
+            return
+        for req in self._discovery_picks(off_sport):
+            yield req.replace(cb_kwargs={**req.cb_kwargs, "discovery_only": True})
+
+    def _discovery_picks(self, requests):
+        """The off-sport schedule requests worth spending the discovery budget on."""
+        ordered = sorted(requests, key=self._connector_rank)
+        if self.discovery_schedules is None:
+            return ordered
+        return ordered[:self.discovery_schedules]
+
+    @staticmethod
+    def _connector_rank(request):
+        sport = ((request.cb_kwargs.get("team") or {}).get("sport") or "").strip().lower()
+        return CONNECTOR_SPORTS.index(sport) if sport in CONNECTOR_SPORTS else len(CONNECTOR_SPORTS)
 
 
 # --------------------------------------------------------------------------- #
