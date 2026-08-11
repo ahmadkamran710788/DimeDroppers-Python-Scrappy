@@ -181,7 +181,7 @@ class MaxPrepTwoFilePipeline:
         )
 
 
-def run_crawl(states, sports, levels="Varsity", discover=True, output_dir=None):
+def run_crawl(states, sports, levels="all", discover=True, output_dir=None):
     """Run exactly one sports-filtered crawl to completion (one Twisted reactor).
 
     Shared by the CLI (``main``) and the API worker (``worker.py``). Writes only the
@@ -220,9 +220,9 @@ def main():
     parser.add_argument("states", help="comma-separated state codes, e.g. ny or ny,ca,tx")
     parser.add_argument("sports", help='comma-separated sport names, e.g. Football '
                                        'or "Football,Basketball" (match MaxPreps labels)')
-    parser.add_argument("--levels", default="Varsity",
-                        help='team levels to pull schedules for: "Varsity" (default) or '
-                             '"all" to include JV/Freshman')
+    parser.add_argument("--levels", default="all",
+                        help='team levels to pull schedules for: "all" (default: Varsity + '
+                             'JV + Freshman) or e.g. "Varsity" for varsity-only (~3x faster)')
     parser.add_argument("--no-discover", action="store_true",
                         help="disable the graph crawl that reaches past the 200/state cap")
     parser.add_argument("--output-dir", default=None, help="override output directory")

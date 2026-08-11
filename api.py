@@ -42,12 +42,12 @@ MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
 # Wall-clock backstop: a job 'running' longer than this is treated as failed, so a
 # crashed/hung crawl can never pin a concurrency slot forever. This is a LAST RESORT --
 # the crawl bounds itself first (settings.CLOSESPIDER_TIMEOUT) and so does each enrichment
-# step (worker.py GOFAN/NFHS/OPPONENT timeouts). Keep this above their sum so a legitimate
-# long job is never killed mid-run. The deployed values (render.yaml) are
-# CLOSESPIDER_TIMEOUT 14400 + GoFan 900 + NFHS 900 + opponent 1800 = 18000, against a
-# JOB_MAX_RUNTIME_SECONDS of 19800. The default below matches the un-overridden
-# settings.py CLOSESPIDER_TIMEOUT (1800) + the same three enrichment caps = 5400.
-JOB_MAX_RUNTIME_SECONDS = int(os.environ.get("JOB_MAX_RUNTIME_SECONDS", "5700"))
+# step (worker.py's harvest/GoFan/NFHS/resolve timeouts). Keep this above their sum so a
+# legitimate long job is never killed mid-run.
+#   deployed (render.yaml): 14400 + 1800 + 900 + 900 + 300 = 18300  vs  19800  (1500 margin)
+#   local default:           1800 + 1800 + 900 + 900 + 300 =  5700  vs   6300  ( 600 margin)
+# If you add or raise an enrichment cap in worker.py, raise this and render.yaml with it.
+JOB_MAX_RUNTIME_SECONDS = int(os.environ.get("JOB_MAX_RUNTIME_SECONDS", "6300"))
 # Common high-school sports as MaxPreps labels them (for the frontend dropdown).
 COMMON_SPORTS = [
     "Football", "Basketball", "Baseball", "Softball", "Soccer", "Volleyball",
@@ -185,7 +185,9 @@ def start_scrape(payload: dict):
     # worker.py -> run_crawl -> FilteredMaxPrepsSpider, which treats an empty value as
     # target_sports=None (no filtering). See DD-Scrapper/max_prep_scraper.py.
     sports = (payload.get("sports") or "").strip()
-    levels = (payload.get("levels") or "Varsity").strip() or "Varsity"
+    # Default "all" = Varsity + JV + Freshman. The frontend's CSVs are expected to carry
+    # every level; pass "Varsity" explicitly for the (roughly 3x faster) varsity-only crawl.
+    levels = (payload.get("levels") or "all").strip() or "all"
     discover = payload.get("discover", True)
 
     # Reconcile finished/dead subprocesses first so only genuinely-running crawls count

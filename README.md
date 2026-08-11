@@ -158,7 +158,7 @@ uvicorn api:app --reload          # http://localhost:8000
 
 | Method & path | Purpose |
 |---|---|
-| `POST /scrape` | Start a crawl. Body: `{ "states": "wy", "sports": "Football", "levels": "Varsity", "discover": true }`. Returns `{ job_id, status }`. |
+| `POST /scrape` | Start a crawl. Body: `{ "states": "wy", "sports": "Football", "levels": "all", "discover": true }`. Returns `{ job_id, status }`. `levels` defaults to `all` (Varsity + JV + Freshman); pass `"Varsity"` for a ~3x faster varsity-only crawl. |
 | `GET /scrape/{job_id}` | Poll status: `{ status: running\|done\|error, counts, error }`. |
 | `GET /scrape/{job_id}/results?type=teams\|schedule` | Parsed CSV rows as JSON (when done). |
 | `GET /scrape/{job_id}/download?type=teams\|schedule` | Download `teams.csv` / `schedule.csv`. |
@@ -185,13 +185,26 @@ failures, so a job always returns usable data even if a step times out.
 
 | Column | Source |
 |---|---|
-| `original_opponent_school_name` | The opponent's real school name, read from the breadcrumb on its MaxPreps page minus the sport. Cross-referenced against the teams CSV so a school that appears in both files gets the same `original_name` spelling in each; falls back to the scraped name, then to the raw `opponent` text |
+| `original_opponent_school_name` | The opponent's real school name, matched to its teams-CSV row by `school_id` so a school spelled one way in `teams.csv` is spelled the same way here; falls back to a normalized name match, then to the raw `opponent` text |
 | `original_opponent_school_logo` | The opponent school's logo URL from its MaxPreps page |
+
+Every opponent also gets its own row in `teams.csv`, tagged `discovered_via=opponent:schedule`
+and deduplicated on `school_id`. This matters because the crawler only follows schools in the
+states you asked for, so an opponent from a neighbouring state would otherwise appear in
+`schedule.csv` with no corresponding school row. The two exceptions are opponents with no link
+and MaxPreps' placeholder opponents (`/utility/about_pseudo_schools.aspx`) — there is no school
+behind either, so those rows keep their raw opponent text.
 
 Both opponent columns can also be (re)built by hand against an existing pair of CSVs:
 
 ```bash
+# both phases back to back
 python enrich_opponent.py output/max_prep_schedule.csv output/max_prep_School.csv
+
+# or separately -- worker.py splits them so GoFan/NFHS run in between and cover the
+# schools the harvest adds. Only `harvest` touches the network.
+python enrich_opponent.py harvest output/max_prep_schedule.csv output/max_prep_School.csv
+python enrich_opponent.py resolve output/max_prep_schedule.csv output/max_prep_School.csv
 ```
 
 ```bash

@@ -1,5 +1,29 @@
 #!/usr/bin/env python
-"""Add each game's opponent school name + logo to a schedule CSV, in place.
+"""Opponent reconciliation, in two phases.
+
+    harvest   every opponent in the schedule gets a row in the TEAMS csv   (network)
+    resolve   every game gets its opponent's school name + logo            (no network)
+
+Why two phases. The crawler's ``_maybe_follow_school`` gates discovered urls on the
+requested states, so an opponent filed under another state is never crawled -- its game
+lands in the schedule CSV with no matching teams row. Fixing that in the crawl would spend
+crawl budget and still not be guaranteed under truncation, so it is done here instead,
+where it is bounded and deterministic.
+
+The two outputs have opposite ordering constraints: the school rows must exist BEFORE the
+GoFan/NFHS steps so those cover them, but the opponent's display name is only final AFTER
+GoFan has written ``original_name``. So the page is fetched once by ``harvest``, which
+parks what it learned in ``opponents.json``; ``resolve`` then runs after GoFan/NFHS off
+that cache with no further requests. See the phase list in ``worker.py``.
+
+``harvest`` only fetches opponents that are NOT already teams rows -- one whose root url is
+already in the CSV is read straight from it. That makes this strictly cheaper than the
+single pass it replaces, which fetched every distinct opponent unconditionally.
+
+Both phases are best-effort and idempotent, and write atomically (tmp + ``os.replace``), so
+a crash or a timeout can never leave a half-written CSV.
+
+Add each game's opponent school name + logo to a schedule CSV, in place.
 
 The schedule table only gives us the opponent's short display text ("Saint Mary's") and a
 link to that opponent's team page. This step follows the link and turns it into two columns:
@@ -50,6 +74,7 @@ from scrapy.utils.project import get_project_settings
 # Reuse the proven name normalizer rather than re-implementing it.
 from enrich_gofan import normalize
 from maxpreps_scraper.nextdata import page_props
+from maxpreps_scraper.schoolinfo import school_row
 from maxpreps_scraper.states import STATES
 
 NAME_COLUMN = "original_opponent_school_name"
@@ -309,91 +334,167 @@ def school_logo(response):
 
 
 # --------------------------------------------------------------------------- #
-# Spider
+# URL + CSV helpers
 # --------------------------------------------------------------------------- #
-class OpponentSpider(scrapy.Spider):
-    name = "opponent_enrich"
+_ORIGIN = re.compile(r"^(https?://[^/]+)")
 
-    def __init__(self, csv_path=None, index=None, *args, **kwargs):
+
+def school_root_url(url):
+    """Opponent TEAM url -> that school's ROOT url, or "".
+
+    ``https://www.maxpreps.com/ca/albany/saint-marys-panthers/basketball/``
+      -> ``https://www.maxpreps.com/ca/albany/saint-marys-panthers/``
+
+    The root is the page ``spiders/maxpreps.py`` itself parses, so it is the one that
+    reliably carries a full ``schoolContext.schoolInfo``. A team page may carry a reduced
+    payload, which is why the harvest fetches roots rather than the link as-found.
+    """
+    origin = _ORIGIN.match((url or "").strip())
+    parts = url_path_parts(url)
+    if not origin or len(parts) < 3:
+        return ""
+    return f"{origin.group(1)}/{parts[0]}/{parts[1]}/{parts[2]}/"
+
+
+def _norm_url(url):
+    return (url or "").strip().rstrip("/").lower()
+
+
+def _read_csv(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        return list(reader), list(reader.fieldnames or [])
+
+
+def _write_csv(path, fieldnames, rows):
+    """Atomic rewrite: a crash or timeout can never leave a half-written CSV."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore", restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, path)
+
+
+def cache_path_for(schedule_csv):
+    """Where the harvest parks what it learned, for ``resolve`` to reuse."""
+    return os.path.join(os.path.dirname(os.path.abspath(schedule_csv)), "opponents.json")
+
+
+def opponent_roots(schedule_rows):
+    """Distinct school-root urls referenced as opponents, root -> a sport that used it.
+
+    The sport is only needed for the breadcrumb-based name fallback. Placeholder opponents
+    (``/utility/about_pseudo_schools.aspx``) and rows with no link are skipped by
+    ``is_school_url`` -- there is no school behind them, so they keep their raw text.
+    """
+    roots = {}
+    for row in schedule_rows:
+        url = (row.get("opponent_url") or "").strip()
+        if not url.lower().startswith(("http://", "https://")) or not is_school_url(url):
+            continue
+        root = school_root_url(url)
+        if root:
+            roots.setdefault(root, row.get("sport"))
+    return roots
+
+
+# --------------------------------------------------------------------------- #
+# Phase A: harvest -- the only step that touches the network
+# --------------------------------------------------------------------------- #
+class HarvestSpider(scrapy.Spider):
+    """Fetch opponent schools the crawl never reached and append them to the teams CSV.
+
+    Only opponents ABSENT from the teams CSV are fetched. One whose root url is already a
+    teams row needs no request at all -- its name and logo are read straight out of that
+    row. That makes this pass strictly cheaper than the old one, which fetched every
+    distinct opponent unconditionally.
+    """
+
+    name = "opponent_harvest"
+
+    def __init__(self, schedule_csv=None, teams_csv=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.csv_path = csv_path
-        self.index = index
-        with open(csv_path, newline="", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh)
-            self.rows = list(reader)
-            self.fieldnames = list(reader.fieldnames or [])
+        self.teams_csv = teams_csv
+        self.cache_path = cache_path_for(schedule_csv)
 
-        # Append each column exactly once (idempotent on re-run).
-        extra = [c for c in (NAME_COLUMN, LOGO_COLUMN) if c not in self.fieldnames]
-        self.out_fields = self.fieldnames + extra
+        schedule_rows, _ = _read_csv(schedule_csv)
+        self.teams_rows, self.teams_fields = _read_csv(teams_csv)
 
-        # Pre-fill EVERY row with its fallback so no row is ever left blank: rows whose
-        # opponent has no link, or whose page fails to load, simply keep these values.
-        for row in self.rows:
-            row[NAME_COLUMN] = _clean(row.get("opponent"))
-            row[LOGO_COLUMN] = ""
+        self.known_ids = {(r.get("school_id") or "").strip()
+                          for r in self.teams_rows if (r.get("school_id") or "").strip()}
+        by_url = {_norm_url(r.get("url")): r for r in self.teams_rows if r.get("url")}
 
-        # One fetch per distinct opponent URL, however many games reference it.
-        self.by_url = {}
-        for i, row in enumerate(self.rows):
-            url = (row.get("opponent_url") or "").strip()
-            if not url.lower().startswith(("http://", "https://")):
-                continue
-            if not is_school_url(url):
-                continue  # placeholder opponent (/utility/...) -> keep the raw opponent text
-            entry = self.by_url.setdefault(url, {"sport": row.get("sport"), "rows": []})
-            entry["rows"].append(i)
+        # root url -> {school_id, name, logo}; consumed by resolve()
+        self.cache = {}
+        self.to_fetch = {}
+        for root, sport in opponent_roots(schedule_rows).items():
+            hit = by_url.get(_norm_url(root))
+            if hit:                                   # already a teams row -> no request
+                self.cache[root] = {
+                    "school_id": (hit.get("school_id") or "").strip(),
+                    "name": _clean(hit.get("name")),
+                    "logo": _clean(hit.get("mascot_url")),
+                }
+            else:
+                self.to_fetch[root] = sport
 
-        self.scraped = 0
+        self.added = 0
 
     def start_requests(self):
-        for url, entry in self.by_url.items():
+        for root, sport in self.to_fetch.items():
             yield scrapy.Request(
-                url,
+                root,
                 callback=self.parse,
                 errback=self.errback,
-                cb_kwargs={"url": url, "sport": entry["sport"]},
+                cb_kwargs={"root": root, "sport": sport},
                 dont_filter=True,
                 meta={"download_timeout": 20},
             )
 
-    def parse(self, response, url, sport):
-        name = school_name(response, sport)
-        logo = school_logo(response)
-        if not (name or logo):
-            return  # nothing usable on the page -> every row keeps its fallback
+    def parse(self, response, root, sport):
+        row = school_row(page_props(response.text), url=root,
+                         discovered_via="opponent:schedule")
+        if row:
+            name, logo = _clean(row["name"]), _clean(row["mascot_url"])
+            sid = (row["school_id"] or "").strip()
+        else:
+            # No schoolContext on the page. Still salvage a name/logo for the schedule
+            # columns via the breadcrumb path, but there is no school row to append.
+            name, logo, sid = school_name(response, sport), school_logo(response), ""
 
-        state = state_of(url)
-        resolved = self.index.resolve(name, state) if name else None
-        if name:
-            self.scraped += 1
-        for i in self.by_url[url]["rows"]:
-            if resolved:
-                self.rows[i][NAME_COLUMN] = resolved
-            if logo:
-                self.rows[i][LOGO_COLUMN] = logo
+        self.cache[root] = {"school_id": sid, "name": name, "logo": logo}
+
+        # dedup: school_id is authoritative, and guards against two different opponent
+        # urls (slug changes, alternate spellings) resolving to the same school.
+        if row and sid and sid not in self.known_ids:
+            self.known_ids.add(sid)
+            flat = dict(row)
+            flat["sports"] = "; ".join(row["sports"])
+            # phase 2 already copied name -> original_name for the crawled rows; do the
+            # same here so the GoFan step downstream has a search value for this school.
+            if "original_name" in self.teams_fields:
+                flat["original_name"] = flat["name"]
+            self.teams_rows.append(flat)
+            self.added += 1
 
     def errback(self, failure):
-        url = failure.request.cb_kwargs.get("url")
-        # Rows already carry their fallbacks; nothing to undo.
-        self.logger.debug("opponent fetch failed url=%s: %r", url, failure.value)
+        root = failure.request.cb_kwargs.get("root")
+        self.logger.debug("harvest fetch failed root=%s: %r", root, failure.value)
 
     def closed(self, reason):
-        tmp = self.csv_path + ".tmp"
-        with open(tmp, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=self.out_fields, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(self.rows)
-        os.replace(tmp, self.csv_path)
-        with_logo = sum(1 for r in self.rows if (r.get(LOGO_COLUMN) or "").strip())
+        if self.added:
+            _write_csv(self.teams_csv, self.teams_fields, self.teams_rows)
+        with open(self.cache_path, "w", encoding="utf-8") as fh:
+            json.dump(self.cache, fh)
         self.logger.info(
-            "opponent: wrote %d rows -> %s (%d unique opponent pages, %d named, "
-            "%d rows with a logo)",
-            len(self.rows), self.csv_path, len(self.by_url), self.scraped, with_logo,
+            "harvest: %d distinct opponents (%d already in teams, %d fetched) -> "
+            "added %d schools, teams CSV now %d rows",
+            len(self.cache), len(self.cache) - len(self.to_fetch), len(self.to_fetch),
+            self.added, len(self.teams_rows),
         )
 
 
-# --------------------------------------------------------------------------- #
 def _settings():
     """The project's own polite settings -- these requests hit maxpreps.com."""
     s = get_project_settings()
@@ -405,33 +506,111 @@ def _settings():
     return s
 
 
-def run_enrich(schedule_csv, teams_csv):
-    """Run one opponent enrichment crawl to completion (one Twisted reactor).
+def harvest(schedule_csv, teams_csv):
+    """Append missing opponent schools to the teams CSV and cache what was learned.
 
-    Best-effort: never raises out to the caller. On any error the schedule CSV is left
-    untouched (the atomic ``os.replace`` only runs after a clean ``closed``).
+    Best-effort: never raises out to the caller. Both outputs are written only from a
+    clean ``closed``, and the CSV rewrite is atomic, so a crash or timeout leaves the
+    existing teams CSV exactly as it was.
 
     IMPORTANT: calls ``CrawlerProcess.start()`` (starts+stops the reactor), so run this
     AT MOST ONCE per process -- launch it in its own subprocess.
     """
     for path in (schedule_csv, teams_csv):
         if not os.path.exists(path):
-            print(f"opponent: no such file: {path}", file=sys.stderr)
+            print(f"harvest: no such file: {path}", file=sys.stderr)
             return
     try:
-        index = NameIndex.from_csv(teams_csv)
         process = CrawlerProcess(_settings())
-        process.crawl(OpponentSpider, csv_path=schedule_csv, index=index)
+        process.crawl(HarvestSpider, schedule_csv=schedule_csv, teams_csv=teams_csv)
         process.start()
     except Exception as exc:  # noqa: BLE001 - enrichment must never fail the job
-        print(f"opponent: failed, leaving CSV unchanged: {exc!r}", file=sys.stderr)
+        print(f"harvest: failed, leaving CSVs unchanged: {exc!r}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Phase B: resolve -- pure CSV work, no network
+# --------------------------------------------------------------------------- #
+def resolve(schedule_csv, teams_csv):
+    """Write the two opponent columns into the schedule CSV.
+
+    Runs AFTER the GoFan step, because the name a school is finally known by is the teams
+    row's ``original_name``. Matching is by ``school_id`` where the harvest cached one --
+    exact, rather than the normalised-name comparison ``NameIndex`` has to fall back on.
+
+    Best-effort and idempotent: every row is pre-filled with the raw opponent text, so a
+    missing cache or an unmatched opponent degrades to what the schedule itself said.
+    """
+    for path in (schedule_csv, teams_csv):
+        if not os.path.exists(path):
+            print(f"resolve: no such file: {path}", file=sys.stderr)
+            return
+    try:
+        rows, fieldnames = _read_csv(schedule_csv)
+        out_fields = fieldnames + [c for c in (NAME_COLUMN, LOGO_COLUMN)
+                                   if c not in fieldnames]
+
+        teams_rows, _ = _read_csv(teams_csv)
+        # a school's final display name: GoFan-verified original_name, else the raw name
+        by_id = {(r.get("school_id") or "").strip():
+                 (_clean(r.get("original_name")) or _clean(r.get("name")))
+                 for r in teams_rows if (r.get("school_id") or "").strip()}
+        index = NameIndex.from_csv(teams_csv)   # fallback when there is no school_id
+
+        cache = {}
+        path = cache_path_for(schedule_csv)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                cache = json.load(fh)
+        else:
+            print(f"resolve: no {path}; falling back to raw opponent text", file=sys.stderr)
+
+        named = with_logo = 0
+        for row in rows:
+            row[NAME_COLUMN] = _clean(row.get("opponent"))
+            row[LOGO_COLUMN] = ""
+
+            entry = cache.get(school_root_url((row.get("opponent_url") or "").strip()))
+            if not entry:
+                continue
+
+            resolved = by_id.get(entry.get("school_id") or "")
+            if not resolved and entry.get("name"):
+                resolved = index.resolve(entry["name"], state_of(row.get("opponent_url")))
+            if resolved:
+                row[NAME_COLUMN] = resolved
+                named += 1
+            if entry.get("logo"):
+                row[LOGO_COLUMN] = entry["logo"]
+                with_logo += 1
+
+        _write_csv(schedule_csv, out_fields, rows)
+        print(f"resolve: wrote {len(rows)} rows -> {schedule_csv} "
+              f"({len(cache)} cached opponents, {named} named, {with_logo} with a logo)")
+    except Exception as exc:  # noqa: BLE001 - enrichment must never fail the job
+        print(f"resolve: failed, leaving CSV unchanged: {exc!r}", file=sys.stderr)
+
+
+def run_enrich(schedule_csv, teams_csv):
+    """Both phases back to back -- the by-hand path documented in the README.
+
+    Safe in one process: only ``harvest`` starts a reactor. In ``worker.py`` the two are
+    split so GoFan/NFHS can run in between and cover the newly added schools.
+    """
+    harvest(schedule_csv, teams_csv)
+    resolve(schedule_csv, teams_csv)
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("usage: python enrich_opponent.py <schedule-csv> <teams-csv>", file=sys.stderr)
+    argv = sys.argv[1:]
+    phase = None
+    if argv and argv[0] in ("harvest", "resolve"):
+        phase, argv = argv[0], argv[1:]
+    if len(argv) < 2:
+        print("usage: python enrich_opponent.py [harvest|resolve] <schedule-csv> <teams-csv>",
+              file=sys.stderr)
         raise SystemExit(2)
-    run_enrich(sys.argv[1], sys.argv[2])
+    {"harvest": harvest, "resolve": resolve, None: run_enrich}[phase](argv[0], argv[1])
 
 
 if __name__ == "__main__":

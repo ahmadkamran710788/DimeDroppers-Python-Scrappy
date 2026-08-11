@@ -36,8 +36,9 @@ services:
       # box bounds what a live web crawl can realistically finish.
       - key: CLOSESPIDER_TIMEOUT
         value: "14400"
-      # Last-resort watchdog (s); must exceed CLOSESPIDER_TIMEOUT + GoFan 900 + NFHS 900 +
-      # opponent 1800 (= 18000) so a legitimate long crawl self-closes gracefully before the
-      # watchdog terminates it mid-run. 19800 leaves ~30 min of margin.
+      # Last-resort watchdog (s); must exceed CLOSESPIDER_TIMEOUT 14400 + opponent harvest
+      # 1800 + GoFan 900 + NFHS 900 + opponent resolve 300 (= 18300) so a legitimate long
+      # crawl self-closes gracefully before the watchdog terminates it mid-run. 19800 leaves
+      # 25 min of margin. Raise this whenever an enrichment cap in worker.py goes up.
       - key: JOB_MAX_RUNTIME_SECONDS
         value: "19800"

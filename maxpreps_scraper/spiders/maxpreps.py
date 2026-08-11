@@ -32,6 +32,7 @@ import scrapy
 
 from ..items import SchoolItem, ScheduleGameItem
 from ..nextdata import page_props
+from ..schoolinfo import school_row
 from ..states import ALL_STATE_CODES, STATES
 
 BASE = "https://www.maxpreps.com"
@@ -130,13 +131,16 @@ class MaxPrepsSpider(scrapy.Spider):
         pp = page_props(response.text)
         ctx = pp.get("schoolContext") or {}
         info = ctx.get("schoolInfo") or {}
-        links = pp.get("schoolLinksData") or {}
         school_id = ctx.get("schoolId") or info.get("schoolId")
 
-        # emit the school exactly once
+        # emit the school exactly once. The pageProps -> SCHOOL_FIELDS mapping lives in
+        # ..schoolinfo because enrich_opponent.py's harvest builds the same row for
+        # opponents this crawl never reached; one mapping, so the two can't drift.
         if school_id and school_id not in self._seen_schools:
             self._seen_schools.add(school_id)
-            yield self._build_school_item(response, ctx, info, links, discovered_via)
+            row = school_row(pp, url=response.url, discovered_via=discovered_via)
+            if row:
+                yield SchoolItem(**row)
 
         # 2a. schedules for each sport-season team
         sport_seasons = ctx.get("sportSeasons") or []
@@ -168,41 +172,7 @@ class MaxPrepsSpider(scrapy.Spider):
                 if req:
                     yield req
 
-    def _build_school_item(self, response, ctx, info, links, discovered_via):
-        sport_seasons = ctx.get("sportSeasons") or []
-        # distinct "Sport (Gender)" labels offered by the school
-        sports = sorted({
-            f"{s.get('sport')} ({s.get('gender')})".strip()
-            for s in sport_seasons if s.get("sport")
-        })
-        return SchoolItem(
-            school_id=ctx.get("schoolId") or info.get("schoolId"),
-            name=info.get("name") or info.get("formattedNameWithoutState"),
-            city=info.get("city"),
-            state=info.get("stateCode") or info.get("state"),
-            state_name=info.get("stateName"),
-            url=info.get("canonicalUrl") or response.url,
-            mascot=info.get("mascot"),
-            address=info.get("address"),
-            zip_code=info.get("zipCode") or info.get("zip"),
-            phone=info.get("phone"),
-            color1=(info.get("color1") or "").strip(),
-            color2=(info.get("color2") or "").strip(),
-            color3=(info.get("color3") or "").strip(),
-            mascot_url=info.get("mascotUrl"),
-            league_name=info.get("leagueName"),
-            association_name=info.get("associationName"),
-            governing_body_name=info.get("associationGoverningBodyName"),
-            governing_body_url=info.get("associationGoverningBodyUrl"),
-            website=links.get("website") or info.get("websiteUrl"),
-            facebook=links.get("facebook"),
-            instagram=links.get("instagram"),
-            twitter=links.get("twitter"),
-            youtube=links.get("youtube"),
-            sports=sports,
-            sports_count=len(sports),
-            discovered_via=discovered_via,
-        )
+    # (the pageProps -> SchoolItem mapping now lives in ..schoolinfo.school_row)
 
     # ------------------------------------------------------------------ #
     # 3. schedule pages
