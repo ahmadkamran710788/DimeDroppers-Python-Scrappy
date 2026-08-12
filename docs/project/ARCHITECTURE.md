@@ -312,16 +312,39 @@ name or city mismatch and then writes `""`. Where MaxPreps publishes a partner l
 school's own page, that is first-party evidence we already have in hand — the page was
 fetched and parsed by `parse_school` regardless — so it costs zero extra requests.
 
-`schoolinfo.partner_links()` extracts them. Two properties are load-bearing:
+`schoolinfo.partner_links()` extracts them. Four properties are load-bearing:
 
-- **Key-agnostic.** It scans *every* URL in the `pageProps` blob (breadth-first, depth- and
-  node-capped) rather than reading a guessed key. MaxPreps' Next.js payload shape is not
-  contractual and has moved before; a scan survives a rename.
-- **Site chrome is rejected.** MaxPreps is a CBS/PlayOnSports property and links both
-  partners from its nav/footer. Accepting any `gofan.co` URL would stamp the same useless
-  link onto every row — a column that looks populated but identifies nothing. Only paths
-  naming a specific school or event are accepted (`PARTNERS[*]["accept"]`), school-scoped
-  ranked above event-scoped.
+- **`schoolContext.partnerInfo` is the source of truth**, read before anything else:
+  `ticketingUrl` → GoFan, `streamingUrl` → NFHS. Reading the field beats scanning by a
+  wide margin — an Evanston page carries **81** URLs on partner hosts and only those two
+  belong to the school; the other 79 are `schoolVideos[*]` highlight clips of *other*
+  schools' games. The generic URL scan is kept only as a fallback in case MaxPreps moves
+  the field.
+- **Every candidate must still name a school page.** `/schools/<slug>` for NFHS,
+  `/school/<id>` **or** `/app/school/<id>` for GoFan. GoFan serves both forms and MaxPreps
+  publishes the **short** one — requiring `/app/` rejected every GoFan link on every page
+  (0 captured across a 109-row WY run) until it was fixed. A blocklist can't substitute
+  here: `gofan.co` returns 200 for *every* path, including `/pricing` and nonsense slugs,
+  so status codes carry no signal and only a whitelist keeps nav/footer chrome out.
+- **A partner flag is not a link.** Some schools carry `isAStreamingPartner: True` with
+  `streamingUrl: "https://www.nfhsnetwork.com/"` — the bare homepage (Leyton NE, Spearfish
+  SD). The path filter drops these, and that is deliberate: a homepage identifies no
+  school, so an empty column is the honest answer.
+- **Event links are rejected, and this is not optional.** MaxPreps renders a "related
+  content" module of NFHS broadcast links pointing at **other schools'** games. A live WY
+  run wrote six wrong `nfhs_url` values before this was caught — Rich (UT) got
+  `tintic-high-school-eureka-ut`, Kimball and Mitchell (NE) got `pine-bluffs-wy`, Rigby
+  (ID) got `canyon-ridge-id`, Kelly Walsh (WY) and Yuma (CO) got association-level game
+  URLs. `_REFERRAL_RE` rejects them by `utm_campaign=related-url`, independently of the
+  path filter; those four real URLs are pinned as regression cases. **Match only the
+  campaign** — `utm_medium=referral` rides on every MaxPreps outbound partner link
+  including the legitimate `utm_campaign=school-home` button, so keying on it throws the
+  good links away.
+
+**Why this matters more than it looks:** the GoFan catalog cannot match every school by
+name. GoFan lists Evanston HS as `UCSD #1` with `city: None`, so
+`normalize("Evanston")` vs `normalize("UCSD #1")` can never match, fuzzy or otherwise —
+`go_fan_ticket_url` was blank and *only* MaxPreps' own `ticketingUrl` could fill it.
 
 **Phase 4.5 fills blanks only, per column, independently.** A catalog match that was
 verified to return HTTP 200 is strictly better evidence than an unverified link, so it is

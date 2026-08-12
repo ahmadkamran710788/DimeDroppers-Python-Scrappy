@@ -14,10 +14,23 @@ For each URL it prints:
 
 Reading the output
 ------------------
-The columns are only useful if accepted URLs **differ per school**. A URL that is
-identical across every school is site chrome (a nav or footer link to the partner), not
-that school's page -- if one is being ACCEPTed, tighten the ``accept`` pattern in
-``maxpreps_scraper/schoolinfo.py``. The summary at the end checks exactly that.
+Start at the ``partnerInfo`` block -- that is where MaxPreps publishes the school's own
+links (``ticketingUrl`` / ``streamingUrl``) and it is what the scraper reads. Everything
+after it is fallback and noise: a school page carries ~80 URLs on partner hosts, nearly
+all of them ``schoolVideos[*]`` highlight clips of OTHER schools' games.
+
+Three outcomes worth recognising:
+
+* ``ticketingUrl``/``streamingUrl`` marked ACCEPT -- working as intended.
+* marked ``rejected (not a school page)`` with a value like ``https://gofan.co/`` -- MaxPreps
+  flags the school as a partner but links the partner's homepage. Correctly recorded as
+  empty; a homepage identifies no school.
+* marked rejected with a value that clearly DOES name a school -- a real gap: the accept
+  pattern in ``maxpreps_scraper/schoolinfo.py`` needs widening. This is what hid every
+  GoFan link once already (``/school/<id>`` vs ``/app/school/<id>``).
+
+The summary also flags a URL that is identical across every school, which means site
+chrome leaked past the filter.
 
     python scripts/probe_partner_links.py <school-url> [<school-url> ...]
 
@@ -76,7 +89,19 @@ def probe(url):
     if not pp:
         print("  no __NEXT_DATA__ / pageProps on this page")
 
-    print("\n  -- in __NEXT_DATA__ --")
+    # The authoritative source. Everything below it is fallback/diagnostic noise.
+    info = (pp.get("schoolContext") or {}).get("partnerInfo")
+    print("\n  -- schoolContext.partnerInfo (authoritative) --")
+    if info is None:
+        print("    ABSENT -- MaxPreps moved the field; the scan below is what will be used")
+    else:
+        for k, v in info.items():
+            note = ""
+            if isinstance(v, str) and v:
+                note = "  <- ACCEPT" if _match_partner(v) else "  <- rejected (not a school page)"
+            print(f"    {k:22} = {v!r}{note}")
+
+    print("\n  -- every partner URL in __NEXT_DATA__ --")
     in_blob = set()
     for jpath, found in walk(pp):
         if not interesting(found):

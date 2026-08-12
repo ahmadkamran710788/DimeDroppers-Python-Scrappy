@@ -38,25 +38,42 @@ __all__ = ["SCHOOL_FIELDS", "school_row", "partner_links"]
 # --------------------------------------------------------------------------- #
 _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.I)
 
-# Each entry: the host, and the accepted paths in PREFERENCE order. A school-scoped link
-# is what belongs on a school row, so it outranks a link to one specific event -- a page
-# can legitimately carry both (a "Tickets" button for the school, plus per-game links).
+# Where MaxPreps puts the school's own partner links. Reading this beats scanning: an
+# Evanston page carries 81 URLs on partner hosts and only these 2 belong to the school --
+# the other 79 are schoolVideos[*] highlight clips of OTHER schools' games, which is what
+# contaminated nfhs_url before. The scan below is kept only as a fallback.
+PARTNER_INFO_FIELDS = {"gofan": "ticketingUrl", "nfhs": "streamingUrl"}
+
+# Each entry: the host, and the accepted paths in PREFERENCE order.
+#
+# SCHOOL PAGES ONLY. Two things are load-bearing here:
+#
+# * GoFan serves a school at BOTH `/school/<id>` and `/app/school/<id>` (both verified
+#   200), and MaxPreps publishes the SHORT form -- `partnerInfo.ticketingUrl` for Evanston
+#   is `https://gofan.co/school/WY22664`. Requiring `/app/` rejected every GoFan link on
+#   every page (0 captured across a 109-row WY run). Do not narrow this back.
+# * A blocklist cannot work for gofan.co: it returns 200 for every path, including
+#   /pricing, /support, /about, /events and nonsense slugs. Only an explicit school-path
+#   whitelist keeps nav and footer chrome out.
+#
+# Event links stay rejected: MaxPreps' "related content" module links OTHER schools'
+# games (Rich UT -> tintic-eureka-ut, Kimball/Mitchell NE -> pine-bluffs-wy, Rigby ID ->
+# canyon-ridge-id). An event URL is one game, not a school. Do not add /events/ here.
 PARTNERS = {
     "gofan": {
         "host": re.compile(r"(^|\.)gofan\.co$", re.I),
-        "accept": (
-            re.compile(r"^/app/school/[^/]+", re.I),
-            re.compile(r"^/app/events?/[^/]+", re.I),
-        ),
+        "accept": (re.compile(r"^/(app/)?school/[^/]+", re.I),),
     },
     "nfhs": {
         "host": re.compile(r"(^|\.)nfhsnetwork\.com$", re.I),
-        "accept": (
-            re.compile(r"^/schools?/[^/]+", re.I),
-            re.compile(r"^/events?/[^/]+", re.I),
-        ),
+        "accept": (re.compile(r"^/schools?/[^/]+", re.I),),
     },
 }
+
+# Marks a MaxPreps cross-promo link rather than the school's own. Match ONLY the campaign:
+# `utm_medium=referral` rides on every MaxPreps outbound partner link including the
+# legitimate `utm_campaign=school-home` button, so keying on it would reject the good ones.
+_REFERRAL_RE = re.compile(r"utm_campaign=related", re.I)
 
 # Hard ceilings so a pathological/recursive blob cannot stall a crawl. A school page's
 # pageProps is a few thousand nodes; these are far above that and far below "hangs".
@@ -104,7 +121,7 @@ def _match_partner(url):
     Lower rank is a better fit for a school row -- see ``PARTNERS``.
     """
     host, path = _split_url(url)
-    if not host:
+    if not host or _REFERRAL_RE.search(url):
         return None
     for key, rule in PARTNERS.items():
         if not rule["host"].search(host):
@@ -118,14 +135,27 @@ def _match_partner(url):
 def partner_links(page_props, html=""):
     """GoFan / NFHS links MaxPreps publishes for this school.
 
-    Returns ``{"gofan": url_or_empty, "nfhs": url_or_empty}``. The structured blob is
-    searched first; ``html`` (the raw page) is a fallback for links rendered outside
-    ``__NEXT_DATA__``. The best-ranked URL per partner wins -- a school-scoped link over
-    an event-scoped one -- and is kept verbatim, so we report what MaxPreps published
-    rather than a normalized guess at it.
+    Returns ``{"gofan": url_or_empty, "nfhs": url_or_empty}``, kept verbatim so we report
+    what MaxPreps published rather than a normalized guess at it.
+
+    ``schoolContext.partnerInfo`` is read first and is authoritative. Only if it is absent
+    or says nothing about a partner do we fall back to scanning the blob, then ``html``.
+
+    Every candidate -- however it was found -- must still name a school page. That is what
+    drops the schools MaxPreps flags as partners but links to the partner's *homepage*
+    (``streamingUrl == "https://www.nfhsnetwork.com/"``): a homepage identifies no school,
+    so an empty column is the honest answer.
     """
     found = {"gofan": "", "nfhs": ""}
     best = {"gofan": None, "nfhs": None}
+
+    info = ((page_props or {}).get("schoolContext") or {}).get("partnerInfo") or {}
+    for key, field in PARTNER_INFO_FIELDS.items():
+        url = info.get(field)
+        if isinstance(url, str) and _match_partner(url):
+            found[key], best[key] = url, -1  # outranks anything the scan can turn up
+    if all(found.values()):
+        return found
 
     sources = [_iter_urls(page_props or {})]
     if html:
