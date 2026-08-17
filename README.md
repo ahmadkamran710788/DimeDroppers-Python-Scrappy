@@ -101,9 +101,15 @@ Written to `output/` (override with `-s OUTPUT_DIR=...`):
 | `maxpreps.db` | SQLite with `schools` and `games` tables |
 
 **`schools`** columns: `school_id, name, city, state, state_name, url, mascot,
-address, zip_code, phone, color1-3, mascot_url, league_name, association_name,
-governing_body_name/url, website, facebook, instagram, twitter, youtube,
-maxpreps_gofan_url, maxpreps_nfhs_url, sports, sports_count, discovered_via`
+address, zip_code, state_linking, phone, color1-3, mascot_url, league_name,
+association_name, governing_body_name/url, website, facebook, instagram, twitter,
+youtube, maxpreps_gofan_url, maxpreps_nfhs_url, sports, sports_count, discovered_via`
+
+`state_linking` is the address block MaxPreps prints under the school name on its page,
+as one line — `1725 North Main Spearfish, SD 57783`. It is a formatted join of the
+`address`, `city`, `state` and `zip_code` columns (the street address, **not** the
+school's mailing address, which often differs), so it costs no extra request. Blank
+pieces are skipped, so a school with no street still gets `Pinedale, WY 82941`.
 
 `maxpreps_gofan_url` / `maxpreps_nfhs_url` are the GoFan ticket and NFHS Network
 links **MaxPreps itself publishes** on the school's page, when it has them. They cost

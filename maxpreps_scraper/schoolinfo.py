@@ -1,6 +1,6 @@
 """The single ``__NEXT_DATA__`` -> school row mapping.
 
-Two places have to turn a MaxPreps school page's ``props.pageProps`` into the same 28
+Two places have to turn a MaxPreps school page's ``props.pageProps`` into the same 29
 ``SCHOOL_FIELDS``:
 
 * the crawler (``spiders/maxpreps.py``), one ``SchoolItem`` per school page it visits, and
@@ -21,7 +21,7 @@ from collections import deque
 
 from .export import SCHOOL_FIELDS
 
-__all__ = ["SCHOOL_FIELDS", "school_row", "partner_links"]
+__all__ = ["SCHOOL_FIELDS", "school_row", "partner_links", "state_linking"]
 
 # --------------------------------------------------------------------------- #
 # Partner links (GoFan tickets / NFHS Network) as published by MaxPreps
@@ -176,6 +176,32 @@ def partner_links(page_props, html=""):
     return found
 
 
+def state_linking(info):
+    """The address block MaxPreps prints under the school name, as one line.
+
+        Spearfish High School        <- the name, not part of this
+        1725 North Main              <- schoolInfo.address
+        Spearfish, SD 57783          <- city, stateCode zipCode
+        Partnerships: ...            <- partner_links(), not part of this
+
+    Rendered verbatim ("1725 North Main Spearfish, SD 57783"), so the column reproduces
+    what the page shows. Note it is ``address`` and NOT ``mailingAddress`` -- the two often
+    differ (Spearfish mails to "525 E. Illinois St.", Evanston to "PO Box 6002") and the
+    footer shows the street address.
+
+    Every piece is optional and blanks are skipped, so a school with a city but no street
+    still gets "Pinedale, WY 82941". Returns "" only when MaxPreps has none of them.
+    """
+    info = info or {}
+    state = (info.get("stateCode") or info.get("state") or "").strip()
+    zip_code = (info.get("zipCode") or info.get("zip") or "").strip()
+    location = ", ".join(part for part in (
+        (info.get("city") or "").strip(),
+        " ".join(part for part in (state, zip_code) if part),
+    ) if part)
+    return " ".join(part for part in ((info.get("address") or "").strip(), location) if part)
+
+
 def school_row(page_props, url="", discovered_via="", html=""):
     """Map a school page's ``pageProps`` to a dict keyed by ``SCHOOL_FIELDS``.
 
@@ -218,6 +244,9 @@ def school_row(page_props, url="", discovered_via="", html=""):
         "mascot": info.get("mascot"),
         "address": info.get("address"),
         "zip_code": info.get("zipCode") or info.get("zip"),
+        # the address block as MaxPreps prints it under the school name -- a formatted
+        # join of address + city + state + zip_code, not a separate fetch.
+        "state_linking": state_linking(info),
         "phone": info.get("phone"),
         # branding
         "color1": (info.get("color1") or "").strip(),

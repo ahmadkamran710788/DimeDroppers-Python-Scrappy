@@ -23,6 +23,10 @@ class SchoolItem(scrapy.Item):
     mascot = scrapy.Field()
     address = scrapy.Field()
     zip_code = scrapy.Field()
+    # "1725 North Main Spearfish, SD 57783" -- the address block MaxPreps prints under
+    # the school name, joined from address + city + state + zip_code by
+    # schoolinfo.state_linking(). Derived, not separately fetched.
+    state_linking = scrapy.Field()
     phone = scrapy.Field()
 
     # branding

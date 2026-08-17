@@ -34,7 +34,7 @@ produce two transient CSVs per job.
 | `pipelines.py` | `MultiFormatPipeline` — CSV + SQLite live, JSON on close |
 | `export.py` | `SCHOOL_FIELDS` / `GAME_FIELDS` (the column contract) + DB→CSV/JSON rebuild |
 | `nextdata.py` | `__NEXT_DATA__` blob extractor — `page_props(html)` |
-| `schoolinfo.py` | `school_row(page_props, url, discovered_via, html)` — the **one** `pageProps` → `SCHOOL_FIELDS` mapper. Shared by the spider and the opponent harvest so they can't drift. Also `partner_links()`, the GoFan/NFHS link scanner (§7.1b) |
+| `schoolinfo.py` | `school_row(page_props, url, discovered_via, html)` — the **one** `pageProps` → `SCHOOL_FIELDS` mapper. Shared by the spider and the opponent harvest so they can't drift. Also `state_linking()` (§7.1a) and `partner_links()`, the GoFan/NFHS link scanner (§7.1b) |
 | `states.py` | 50 states + DC, code→name |
 | `settings.py` | Politeness, throttling, memory/time guards |
 | **Entry points** | |
@@ -302,8 +302,33 @@ missing from the CSV header entirely. (Steps 3 and 4 lack this guard — see §9
 `teams.csv`: `original_name`, `go_fan_ticket_url`, `nfhs_url`
 `schedule.csv`: `original_opponent_school_name`, `original_opponent_school_logo`
 
-(`maxpreps_gofan_url` / `maxpreps_nfhs_url` are **not** in this list — they are canonical
-`SCHOOL_FIELDS`, written by the crawl itself, so they appear in `schools.csv` and SQLite too.)
+(`maxpreps_gofan_url` / `maxpreps_nfhs_url` / `state_linking` are **not** in this list — they
+are canonical `SCHOOL_FIELDS`, written by the crawl itself, so they appear in `schools.csv`
+and SQLite too.)
+
+### 7.1a `state_linking` — the address block as MaxPreps prints it
+
+MaxPreps' school page footer renders four lines; `state_linking` is the middle two, joined:
+
+```
+Spearfish High School        <- the name column
+1725 North Main              <- schoolInfo.address
+Spearfish, SD 57783          <- city, stateCode zipCode
+Partnerships: … Live Stream  <- §7.1b
+```
+
+→ `state_linking = "1725 North Main Spearfish, SD 57783"`
+
+`schoolinfo.state_linking()` builds it from the same `schoolInfo` dict `school_row()`
+already reads, so it costs **zero extra requests** and cannot introduce a new failure mode.
+Two things are load-bearing:
+
+- It is **`address`, not `mailingAddress`.** The two frequently differ — Spearfish mails to
+  `525 E. Illinois St.`, Evanston to `PO Box 6002` — and neither appears in the footer.
+  Verified against the live pages for Spearfish SD, Evanston WY and Sublette County WY.
+- **Blank pieces are skipped, not padded.** A school with a city but no street still yields
+  `Pinedale, WY 82941`; one with nothing yields `""` (e.g. Martin Collegiate, whose page
+  carries no `schoolContext` at all). No sentinel, no partial-comma artefacts.
 
 ### 7.1b Partner links — MaxPreps' own GoFan / NFHS links (phase 4.5)
 

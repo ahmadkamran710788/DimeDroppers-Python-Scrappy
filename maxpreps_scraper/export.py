@@ -18,7 +18,7 @@ import sys
 # column order, kept in sync with pipelines.py
 SCHOOL_FIELDS = [
     "school_id", "name", "city", "state", "state_name", "url",
-    "mascot", "address", "zip_code", "phone",
+    "mascot", "address", "zip_code", "state_linking", "phone",
     "color1", "color2", "color3", "mascot_url",
     "league_name", "association_name", "governing_body_name", "governing_body_url",
     "website", "facebook", "instagram", "twitter", "youtube",
