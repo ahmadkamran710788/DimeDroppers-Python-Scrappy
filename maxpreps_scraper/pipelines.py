@@ -13,8 +13,8 @@ import sqlite3
 
 from itemadapter import ItemAdapter
 
-from .export import GAME_FIELDS, SCHOOL_FIELDS, export_db
-from .items import ScheduleGameItem, SchoolItem
+from .export import GAME_FIELDS, ROSTER_FIELDS, SCHOOL_FIELDS, export_db
+from .items import RosterItem, ScheduleGameItem, SchoolItem
 
 LIST_FIELDS = {"sports"}  # lists -> "a; b; c" for the flat sinks
 COMMIT_EVERY = 100
@@ -41,6 +41,7 @@ class MultiFormatPipeline:
         for kind, fields, name in (
             ("school", SCHOOL_FIELDS, "schools"),
             ("game", GAME_FIELDS, "schedule"),
+            ("roster", ROSTER_FIELDS, "roster"),
         ):
             path = os.path.join(self.output_dir, f"{name}.csv")
             resuming = os.path.exists(path) and os.path.getsize(path) > 0
@@ -54,7 +55,7 @@ class MultiFormatPipeline:
         # SQLite — canonical store
         self._db = sqlite3.connect(os.path.join(self.output_dir, self.db_file))
         self._init_db()
-        self._counts = {"school": 0, "game": 0}
+        self._counts = {"school": 0, "game": 0, "roster": 0}
 
     def _init_db(self):
         cur = self._db.cursor()
@@ -68,12 +69,20 @@ class MultiFormatPipeline:
             + ", ".join(f'"{f}" TEXT' for f in GAME_FIELDS)
             + ', PRIMARY KEY ("school_id", "schedule_url", "game_index"))'
         )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS roster ("
+            + ", ".join(f'"{f}" TEXT' for f in ROSTER_FIELDS)
+            # roster_url distinguishes the Roster tab from the Staff tab AND one level
+            # from another, so players and staff can never collide on this key.
+            + ', PRIMARY KEY ("school_id", "roster_url", "row_index"))'
+        )
         # Lightweight migration: CREATE TABLE IF NOT EXISTS leaves a pre-existing table
         # untouched, so a DB built before a field was added (e.g. games.level) lacks the
         # new column and INSERT would fail with "no column named ...". Add any missing
         # columns in place so re-crawls against an old maxpreps.db keep working.
         self._ensure_columns(cur, "schools", SCHOOL_FIELDS)
         self._ensure_columns(cur, "games", GAME_FIELDS)
+        self._ensure_columns(cur, "roster", ROSTER_FIELDS)
         self._db.commit()
 
     @staticmethod
@@ -89,6 +98,8 @@ class MultiFormatPipeline:
             self._write("school", "schools", SCHOOL_FIELDS, item)
         elif isinstance(item, ScheduleGameItem):
             self._write("game", "games", GAME_FIELDS, item)
+        elif isinstance(item, RosterItem):
+            self._write("roster", "roster", ROSTER_FIELDS, item)
         return item
 
     def _write(self, kind, table, fields, item):
@@ -117,9 +128,10 @@ class MultiFormatPipeline:
         self._db.close()
         # rebuild clean, de-duplicated CSV + JSON from the canonical DB
         try:
-            n_s, n_g = export_db(self.output_dir, self.db_file)
+            n_s, n_g, n_r = export_db(self.output_dir, self.db_file)
             spider.logger.info(
-                "Finalized %d schools and %d games -> CSV + JSON (from SQLite)", n_s, n_g
+                "Finalized %d schools, %d games and %d roster rows -> CSV + JSON "
+                "(from SQLite)", n_s, n_g, n_r
             )
         except Exception as exc:  # never let export failure mask a finished crawl
             spider.logger.warning("Export from DB failed (%s); CSV still has appended rows", exc)

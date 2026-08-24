@@ -30,8 +30,9 @@ Usage examples
 """
 import scrapy
 
-from ..items import SchoolItem, ScheduleGameItem
+from ..items import RosterItem, SchoolItem, ScheduleGameItem
 from ..nextdata import page_props
+from ..rosterinfo import cell_text, roster_rows, team_subpage
 from ..schoolinfo import school_row
 from ..states import ALL_STATE_CODES, STATES
 
@@ -58,7 +59,7 @@ class MaxPrepsSpider(scrapy.Spider):
     allowed_domains = ["maxpreps.com"]
 
     def __init__(self, states=None, schedules="1", discover="1", levels="Varsity",
-                 *args, **kwargs):
+                 rosters="0", *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         # which states to crawl: comma-separated codes, or "all"
@@ -72,6 +73,13 @@ class MaxPrepsSpider(scrapy.Spider):
 
         self.crawl_schedules = _truthy(schedules, True)
         self.discover = _truthy(discover, True)
+        # Roster + Staff tabs. OFF by default: they add TWO pages per team-season on top
+        # of the schedule, roughly tripling the crawl's page count, which on a
+        # truncation-bound run costs discovered schools (see settings.py's BFS note).
+        # The API path turns it on explicitly (max_prep_scraper.run_crawl), the same way
+        # it overrides levels to "all"; run.py / backfill_all.py exist to maximise SCHOOL
+        # coverage and keep it off.
+        self.crawl_rosters = _truthy(rosters, False)
         # which team levels to fetch schedules for: "Varsity" (default) or "all"
         self.levels = (
             None if str(levels).lower() == "all"
@@ -143,27 +151,42 @@ class MaxPrepsSpider(scrapy.Spider):
             if row:
                 yield SchoolItem(**row)
 
-        # 2a. schedules for each sport-season team
+        # 2a. schedules (and, when enabled, rosters) for each sport-season team
         sport_seasons = ctx.get("sportSeasons") or []
-        if self.crawl_schedules:
+        if self.crawl_schedules or self.crawl_rosters:
+            school = {
+                "school_id": school_id,
+                "name": info.get("name") or info.get("formattedName"),
+                "state": info.get("stateCode") or info.get("state"),
+            }
             for ss in sport_seasons:
                 if self.levels and (ss.get("level") or "").lower() not in self.levels:
                     continue
                 team_url = ss.get("canonicalUrl")
                 if not team_url:
                     continue
-                # some (esp. past-season) canonicalUrls already end in /schedule/
-                base = team_url.rstrip("/")
-                schedule_url = base + "/" if base.endswith("/schedule") else base + "/schedule/"
-                yield scrapy.Request(
-                    schedule_url,
-                    callback=self.parse_schedule,
-                    cb_kwargs={"team": ss, "school": {
-                        "school_id": school_id,
-                        "name": info.get("name") or info.get("formattedName"),
-                        "state": info.get("stateCode") or info.get("state"),
-                    }},
-                )
+                if self.crawl_schedules:
+                    # some (esp. past-season) canonicalUrls already end in /schedule/
+                    base = team_url.rstrip("/")
+                    schedule_url = base + "/" if base.endswith("/schedule") else base + "/schedule/"
+                    yield scrapy.Request(
+                        schedule_url,
+                        callback=self.parse_schedule,
+                        cb_kwargs={"team": ss, "school": school},
+                    )
+                # The Roster and Staff tabs are two separate pages of the same team.
+                # One callback handles both -- the category is what tells rosterinfo
+                # which table to look for and what to label the rows.
+                if self.crawl_rosters:
+                    for category, page in (("player", "roster"), ("staff", "staff")):
+                        url = team_subpage(team_url, page)
+                        if url:
+                            yield scrapy.Request(
+                                url,
+                                callback=self.parse_roster,
+                                cb_kwargs={"team": ss, "school": school,
+                                           "category": category},
+                            )
 
         # 2b. graph expansion via nearby schools
         if self.discover:
@@ -222,11 +245,11 @@ class MaxPrepsSpider(scrapy.Spider):
             cells = row.xpath('./td')
             if len(cells) < 2:
                 continue
-            date = self._cell_text(cells[0])
+            date = cell_text(cells[0])
             opp_cell = cells[1]
             opp_link = opp_cell.xpath('.//a[contains(@href, "/")]/@href').get()
-            opponent = self._cell_text(opp_cell)
-            game_info = self._cell_text(cells[2]) if len(cells) > 2 else ""
+            opponent = cell_text(opp_cell)
+            game_info = cell_text(cells[2]) if len(cells) > 2 else ""
 
             home_away = "away" if opponent.startswith("@") else "home"
             # strip the "@"/"vs" home-away marker and trailing "*" footnote markers
@@ -256,13 +279,21 @@ class MaxPrepsSpider(scrapy.Spider):
             )
 
     # ------------------------------------------------------------------ #
+    # 4. roster / staff pages
+    # ------------------------------------------------------------------ #
+    def parse_roster(self, response, team, school, category):
+        """Emit one ``RosterItem`` per person on this team's Roster or Staff tab.
+
+        The page -> row mapping lives in ``..rosterinfo`` because ``enrich_roster.py``
+        builds the same rows for opponent schools this crawl never reached; one mapping,
+        so the two can't drift. A page with no matching table yields nothing.
+        """
+        for row in roster_rows(response, team, school, category):
+            yield RosterItem(**row)
+
+    # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _cell_text(cell):
-        text = " ".join(t.strip() for t in cell.xpath('.//text()').getall() if t.strip())
-        return text.strip()
-
     @staticmethod
     def _parse_result(game_info):
         """Pull a leading W/L/T and a digits-digits score out of a Game Info cell."""

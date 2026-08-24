@@ -11,6 +11,7 @@ below. Results go to two dedicated CSVs:
 
     output/max_prep_School.csv      one row per matching school
     output/max_prep_schedule.csv    one row per game (only the requested sports)
+    output/max_prep_roster.csv      one row per player/staff member (same sports)
 
 It does NOT touch the existing code or the canonical schools.csv / schedule.csv /
 maxpreps.db -- it reuses the spider read-only and swaps in its own pipeline.
@@ -30,8 +31,8 @@ from itemadapter import ItemAdapter
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
-from maxpreps_scraper.export import GAME_FIELDS, SCHOOL_FIELDS
-from maxpreps_scraper.items import ScheduleGameItem, SchoolItem
+from maxpreps_scraper.export import GAME_FIELDS, ROSTER_FIELDS, SCHOOL_FIELDS
+from maxpreps_scraper.items import RosterItem, ScheduleGameItem, SchoolItem
 from maxpreps_scraper.spiders.maxpreps import MaxPrepsSpider
 
 LIST_FIELDS = {"sports"}  # lists -> "a; b; c" in the flat CSV (same as the main pipeline)
@@ -97,14 +98,18 @@ class FilteredMaxPrepsSpider(MaxPrepsSpider):
         #   - turn a bounded number of the REMAINING schedule requests into discovery-only
         #     fetches rather than dropping them, so school coverage stays independent of
         #     the sport filter,
+        #   - yield roster/staff requests for the requested sports and DROP the rest
+        #     outright -- unlike schedules, roster pages carry no opponent links, so
+        #     fetching an off-sport one buys no discovery and would just cost budget,
         #   - let nearby-school discovery requests through untouched.
         off_sport = []
         for out in super().parse_school(response, discovered_via=discovered_via):
-            if isinstance(out, scrapy.Request) and out.callback == self.parse_schedule:
+            if isinstance(out, scrapy.Request) and out.callback in (self.parse_schedule,
+                                                                    self.parse_roster):
                 team = out.cb_kwargs.get("team") or {}
                 if not self.target_sports or self._season_matches(team.get("sport")):
                     yield out
-                else:
+                elif out.callback == self.parse_schedule:
                     off_sport.append(out)
             else:
                 yield out
@@ -131,7 +136,10 @@ class FilteredMaxPrepsSpider(MaxPrepsSpider):
 
 
 # --------------------------------------------------------------------------- #
-# Pipeline: write ONLY these two CSVs (no SQLite / JSON, no canonical files).
+# Pipeline: write ONLY these CSVs (no SQLite / JSON, no canonical files).
+#
+# Named "TwoFile" when it wrote two; it now also writes max_prep_roster.csv. The name is
+# kept because api.py and run_crawl() reference it and a rename buys nothing functional.
 # --------------------------------------------------------------------------- #
 class MaxPrepTwoFilePipeline:
     def __init__(self, output_dir):
@@ -147,6 +155,7 @@ class MaxPrepTwoFilePipeline:
         for kind, fields, name in (
             ("school", SCHOOL_FIELDS, "max_prep_School"),
             ("game", GAME_FIELDS, "max_prep_schedule"),
+            ("roster", ROSTER_FIELDS, "max_prep_roster"),
         ):
             fh = open(os.path.join(self.output_dir, f"{name}.csv"), "w",
                       newline="", encoding="utf-8")
@@ -154,13 +163,15 @@ class MaxPrepTwoFilePipeline:
             writer.writeheader()
             self._files[kind] = fh
             self._writers[kind] = writer
-        self._counts = {"school": 0, "game": 0}
+        self._counts = {"school": 0, "game": 0, "roster": 0}
 
     def process_item(self, item, spider):
         if isinstance(item, SchoolItem):
             self._write("school", SCHOOL_FIELDS, item)
         elif isinstance(item, ScheduleGameItem):
             self._write("game", GAME_FIELDS, item)
+        elif isinstance(item, RosterItem):
+            self._write("roster", ROSTER_FIELDS, item)
         return item
 
     def _write(self, kind, fields, item):
@@ -176,16 +187,22 @@ class MaxPrepTwoFilePipeline:
         for fh in self._files.values():
             fh.close()
         spider.logger.info(
-            "Wrote %d schools and %d games -> %s/max_prep_School.csv, max_prep_schedule.csv",
-            self._counts["school"], self._counts["game"], self.output_dir,
+            "Wrote %d schools, %d games and %d roster rows -> %s/max_prep_School.csv, "
+            "max_prep_schedule.csv, max_prep_roster.csv",
+            self._counts["school"], self._counts["game"], self._counts["roster"],
+            self.output_dir,
         )
 
 
-def run_crawl(states, sports, levels="all", discover=True, output_dir=None):
+def run_crawl(states, sports, levels="all", discover=True, output_dir=None, rosters=True):
     """Run exactly one sports-filtered crawl to completion (one Twisted reactor).
 
     Shared by the CLI (``main``) and the API worker (``worker.py``). Writes only the
-    two CSVs via ``MaxPrepTwoFilePipeline`` -- never the canonical CSV/JSON/DB.
+    three CSVs via ``MaxPrepTwoFilePipeline`` -- never the canonical CSV/JSON/DB.
+
+    ``rosters`` defaults to True here even though the spider defaults it off: this is the
+    path that feeds the frontend's CSVs, and those are expected to carry the roster, the
+    same reasoning that makes ``levels`` default to "all" here.
 
     IMPORTANT: this calls ``CrawlerProcess.start()``, which starts and then stops the
     Twisted reactor. A reactor cannot be restarted, so call this AT MOST ONCE per
@@ -210,6 +227,7 @@ def run_crawl(states, sports, levels="all", discover=True, output_dir=None):
         schedules="1",  # we want schedules
         discover="1" if discover else "0",
         levels=levels,
+        rosters="1" if rosters else "0",
     )
     process.start()
 
@@ -225,6 +243,10 @@ def main():
                              'JV + Freshman) or e.g. "Varsity" for varsity-only (~3x faster)')
     parser.add_argument("--no-discover", action="store_true",
                         help="disable the graph crawl that reaches past the 200/state cap")
+    parser.add_argument("--no-rosters", action="store_true",
+                        help="skip the Roster/Staff tabs (2 fewer pages per team-season, "
+                             "so a substantially faster crawl); max_prep_roster.csv is "
+                             "then written with only its header")
     parser.add_argument("--output-dir", default=None, help="override output directory")
     args = parser.parse_args()
 
@@ -234,6 +256,7 @@ def main():
         levels=args.levels,
         discover=not args.no_discover,
         output_dir=args.output_dir,
+        rosters=not args.no_rosters,
     )
 
 

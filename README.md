@@ -1,8 +1,8 @@
 # MaxPreps Scraper
 
 A [Scrapy](https://scrapy.org) crawler that collects **high schools**, the **sports**
-each school offers, and every team's **game schedule** from
-[MaxPreps](https://www.maxpreps.com), across all 50 states + DC.
+each school offers, every team's **game schedule**, and every team's **roster and
+coaching staff** from [MaxPreps](https://www.maxpreps.com), across all 50 states + DC.
 
 Every record is written to **three formats at once**: CSV, JSON, and a SQLite database.
 
@@ -79,6 +79,13 @@ scrapy crawl maxpreps                       # all states (default)
 | `schedules` | `1` | Crawl each team's schedule page (`0` = schools + sports only) |
 | `discover` | `1` | Graph-crawl via nearby schools + opponents to beat the 200 cap |
 | `levels` | `Varsity` | Team levels to fetch schedules for; `all` adds JV/Freshman |
+| `rosters` | `0` | Also crawl each team's Roster + Staff tabs (`1` = on) |
+
+`rosters` is **off** here on purpose: it adds two pages per team-season on top of the
+schedule, so it roughly triples the crawl's page count, and on a time-capped run that
+costs graph-discovered schools. The API path turns it on (see below); `run.py` and
+`backfill_all.py` exist to maximise *school* coverage and leave it off. Enable it with
+`python run.py wy -a rosters=1`.
 
 ### Make a big crawl resumable
 
@@ -98,7 +105,8 @@ Written to `output/` (override with `-s OUTPUT_DIR=...`):
 |------|----------|
 | `schools.csv` / `schools.json` | one row per school |
 | `schedule.csv` / `schedule.json` | one row per game |
-| `maxpreps.db` | SQLite with `schools` and `games` tables |
+| `roster.csv` / `roster.json` | one row per player / staff member (header-only unless `-a rosters=1`) |
+| `maxpreps.db` | SQLite with `schools`, `games` and `roster` tables |
 
 **`schools`** columns: `school_id, name, city, state, state_name, url, mascot,
 address, zip_code, state_linking, phone, color1-3, mascot_url, league_name,
@@ -119,6 +127,17 @@ links only to the partners' home pages rather than to that school.
 **`games`** columns: `school_id, school_name, state, sport, gender, season, level,
 game_index, date, home_away, opponent, opponent_url, result, score, game_info,
 schedule_url`
+
+**`roster`** columns: `school_id, school_name, state, sport, gender, season, level,
+category, row_index, jersey_number, name, grade, position, height, weight, roster_url`
+
+One row per person on a team's **Roster** tab (`category = player`) or its **Staff** tab
+(`category = staff`). The leading block is identical to `games`, so a roster row joins to a
+schedule row on the same keys — including `level` (`Varsity` / `JV` / `Freshman`) and
+`sport`. `jersey_number`, `grade`, `height` and `weight` are player-only and blank on staff
+rows; `name` is the Player or Staff column and `position` is `WR` / `SS, FS` for players and
+`Head Coach` / `Assistant Coach` for staff. Values are kept exactly as MaxPreps displays
+them (`6'0"`, `178 lbs`), and `row_index` counts emitted rows within one table.
 
 JSON files are proper, streaming JSON arrays. SQLite uses `INSERT OR REPLACE`
 keyed on the school / game, so re-running updates rows in place rather than
@@ -158,6 +177,11 @@ uses an **async job model**: each crawl runs in its own subprocess (`worker.py`)
 and results are transient CSV files under `jobs/<job_id>/` (no database; files are
 deleted on `DELETE` or swept on restart).
 
+This path produces **three** CSVs — `teams.csv`, `schedule.csv` and `roster.csv` — and,
+unlike the canonical CLI, it crawls rosters by default (same reasoning as `levels=all`:
+the frontend's CSVs are expected to be complete). Pass `--no-rosters` to
+`max_prep_scraper.py` for a substantially faster crawl without them.
+
 ### Run locally
 
 ```bash
@@ -171,8 +195,8 @@ uvicorn api:app --reload          # http://localhost:8000
 |---|---|
 | `POST /scrape` | Start a crawl. Body: `{ "states": "wy", "sports": "Football", "levels": "all", "discover": true }`. Returns `{ job_id, status }`. `levels` defaults to `all` (Varsity + JV + Freshman); pass `"Varsity"` for a ~3x faster varsity-only crawl. |
 | `GET /scrape/{job_id}` | Poll status: `{ status: running\|done\|error, counts, error }`. |
-| `GET /scrape/{job_id}/results?type=teams\|schedule` | Parsed CSV rows as JSON (when done). |
-| `GET /scrape/{job_id}/download?type=teams\|schedule` | Download `teams.csv` / `schedule.csv`. |
+| `GET /scrape/{job_id}/results?type=teams\|schedule\|roster` | Parsed CSV rows as JSON (when done). |
+| `GET /scrape/{job_id}/download?type=teams\|schedule\|roster` | Download `teams.csv` / `schedule.csv` / `roster.csv`. |
 | `DELETE /scrape/{job_id}` | Delete the job's temp files. |
 | `GET /states` | `[{ code, name }]` for all 50 states + DC. |
 | `GET /sports` | Common sport labels for a dropdown. |
@@ -218,6 +242,19 @@ states you asked for, so an opponent from a neighbouring state would otherwise a
 `schedule.csv` with no corresponding school row. The two exceptions are opponents with no link
 and MaxPreps' placeholder opponents (`/utility/about_pseudo_schools.aspx`) — there is no school
 behind either, so those rows keep their raw opponent text.
+
+`roster.csv` carries no extra columns — it has the same schema on both paths. It does get one
+extra *step*: `enrich_roster.py` closes the same gap for rosters that the opponent harvest
+closes for school rows. Those harvested opponent schools were never crawled, so they have no
+roster; this step fetches the Roster + Staff tabs for every school in `teams.csv` that has no
+roster rows yet, honouring the same sport and level filters as the crawl. Keying on "has no
+rows yet" rather than on `discovered_via` also makes it self-healing — a school whose roster
+fetch failed mid-crawl is picked up on the next run.
+
+```bash
+# rebuild opponent rosters by hand against an existing pair of CSVs
+python enrich_roster.py output/max_prep_roster.csv output/max_prep_School.csv Football all
+```
 
 Both opponent columns can also be (re)built by hand against an existing pair of CSVs:
 

@@ -5,22 +5,23 @@
 > actually works, why it is shaped this way, and what will bite you**.
 > Read this first, then only the files you need.
 
-Last verified against commit `4cd7f4c` — breadth-first scheduling (§4.3) and opponent
-schools in the teams CSV (§7.2) are in — **plus uncommitted work** on MaxPreps' own
-GoFan/NFHS links (§7.1b). ~3,840 LOC, 23 Python files, no tests, no CI.
+Last verified against commit `3fcc39e`, **plus uncommitted work** adding the third
+output, `roster.csv` (§7.3). Breadth-first scheduling (§4.3), opponent schools in the
+teams CSV (§7.2) and MaxPreps' own GoFan/NFHS links (§7.1b) are all in.
+~4,200 LOC, 25 Python files, no tests, no CI.
 
 ---
 
 ## 1. One-paragraph summary
 
-A Scrapy crawler that collects US **high schools**, the **sports** each offers, and
-every team's **game schedule** from MaxPreps (all 50 states + DC), plus a chain of
-best-effort enrichment steps that resolve each school to its **GoFan ticket page**,
-its **NFHS Network page**, and each game's **opponent school name + logo** (and the
-opponent's own school row). It ships
+A Scrapy crawler that collects US **high schools**, the **sports** each offers,
+every team's **game schedule**, and every team's **roster + coaching staff** from
+MaxPreps (all 50 states + DC), plus a chain of best-effort enrichment steps that resolve
+each school to its **GoFan ticket page**, its **NFHS Network page**, and each game's
+**opponent school name + logo** (and the opponent's own school row and roster). It ships
 in two shapes off one spider: a **CLI/batch crawler** (canonical CSV + JSON + SQLite)
 and a **FastAPI HTTP service** on Render that a Next.js/Vercel frontend drives to
-produce two transient CSVs per job.
+produce three transient CSVs per job.
 
 ---
 
@@ -30,10 +31,11 @@ produce two transient CSVs per job.
 |---|---|
 | **`maxpreps_scraper/`** | The Scrapy project proper |
 | `spiders/maxpreps.py` | The only real spider. Directory → school → schedule |
-| `items.py` | `SchoolItem`, `ScheduleGameItem`. **Field order = CSV column order** |
+| `items.py` | `SchoolItem`, `ScheduleGameItem`, `RosterItem`. Column order is `export.py`'s lists, **not** the field order here |
 | `pipelines.py` | `MultiFormatPipeline` — CSV + SQLite live, JSON on close |
-| `export.py` | `SCHOOL_FIELDS` / `GAME_FIELDS` (the column contract) + DB→CSV/JSON rebuild |
+| `export.py` | `SCHOOL_FIELDS` / `GAME_FIELDS` / `ROSTER_FIELDS` (the column contract) + DB→CSV/JSON rebuild |
 | `nextdata.py` | `__NEXT_DATA__` blob extractor — `page_props(html)` |
+| `rosterinfo.py` | `roster_rows(response, team, school, category)` — the **one** roster/staff page → `ROSTER_FIELDS` mapper. Shared by the spider and `enrich_roster.py`. Also `team_subpage()` and `cell_text()` |
 | `schoolinfo.py` | `school_row(page_props, url, discovered_via, html)` — the **one** `pageProps` → `SCHOOL_FIELDS` mapper. Shared by the spider and the opponent harvest so they can't drift. Also `state_linking()` (§7.1a) and `partner_links()`, the GoFan/NFHS link scanner (§7.1b) |
 | `states.py` | 50 states + DC, code→name |
 | `settings.py` | Politeness, throttling, memory/time guards |
@@ -47,6 +49,7 @@ produce two transient CSVs per job.
 | `enrich_gofan.py` | GoFan catalog + the 3-tier `Matcher`. **The matching brain** — reused elsewhere |
 | `enrich_gofan_scrapy.py` | Scrapy step: verify ticket URL → `go_fan_ticket_url`, overwrite `original_name` |
 | `enrich_nfhs.py` | NFHS catalog + matcher → `nfhs_url` |
+| `enrich_roster.py` | Roster + Staff tabs for every teams-CSV school with no roster rows yet (i.e. the harvested opponents). See §7.3 |
 | `enrich_opponent.py` | Two phases: `harvest` (network — opponent schools into the teams CSV) and `resolve` (no network — opponent name + logo into the schedule CSV). See §7.2 |
 | `enrich_website_name.py` | **Orphaned** — see §9.5. Still exports `_settings()` that others import |
 | **Odds and ends** | |
@@ -71,7 +74,8 @@ This is the big one. Scrapy's reactor starts once and dies once. Therefore:
   (`worker.py` → `subprocess.run([sys.executable, "enrich_gofan_scrapy.py", …])`).
 - Any function that calls `CrawlerProcess.start()` is documented "call AT MOST ONCE
   per process": `run_crawl()`, `enrich_gofan_scrapy.run_enrich()`,
-  `enrich_opponent.run_enrich()`, `enrich_website_name.run_enrich()`.
+  `enrich_opponent.run_enrich()`, `enrich_roster.run_enrich()`,
+  `enrich_website_name.run_enrich()`.
 
 **If you add a Scrapy step, it must be a new subprocess.** Do not try to chain two
 crawls in one process.
@@ -116,6 +120,9 @@ MaxPreps is Next.js and **hashes its CSS class names**. So:
   blob via `nextdata.page_props()`. Robust.
 - The schedule **table** → DOM-scraped, but anchored on the `Opponent` / `Date`
   `<th>` **text**, never on classes.
+- The roster / staff **tables** (`rosterinfo.py`) → same idea, anchored on
+  `Player`+`Grade` and `Staff`+`Position`. Cells are then read **by header name**, not by
+  index, because the roster table has a leading `#` column the staff table lacks.
 - Breadcrumbs (`enrich_opponent.py`) → schema.org `BreadcrumbList` JSON-LD first,
   then `<nav aria-label="breadcrumb">`, then any `<ol>`.
 
@@ -127,6 +134,8 @@ MaxPreps is Next.js and **hashes its CSS class names**. So:
 /{state}/schools/              → parse_directory  → groupings[].canonicalUrl
   └ /{state}/{city}/{school}/   → parse_school    → SchoolItem + sportSeasons
        └ …/{sport}/schedule/     → parse_schedule  → ScheduleGameItem per table row
+       └ …/{sport}/roster/       → parse_roster    → RosterItem per player  (rosters=1)
+       └ …/{sport}/staff/        → parse_roster    → RosterItem per staffer (rosters=1)
 ```
 
 ### 4.3 Crawl order is BREADTH-FIRST, on purpose
@@ -164,6 +173,12 @@ Scrapy `-a` always delivers **strings**, hence `_truthy()` in `spiders/maxpreps.
 | `schedules` | `1` | `0` = schools + sports only (fast) |
 | `discover` | `1` | the §3.2 graph crawl |
 | `levels` | `Varsity` | `all` → `None` → no level filter (adds JV/Freshman) |
+| `rosters` | `0` | Crawl the Roster + Staff tabs. **Two extra pages per team-season** |
+
+`rosters` follows the same split as `levels`: the spider defaults it **off** so `run.py` /
+`backfill_all.py` keep their crawl budget (it roughly triples page count, and §4.3 explains
+why that costs discovered schools under truncation), while `run_crawl()` — the API path —
+defaults it **on**, because the frontend's CSVs are expected to carry the roster.
 
 The **spider** default is `Varsity`, but every API-path caller (`api.py`, `worker.py`,
 `run_crawl()`, `max_prep_scraper.py --levels`) defaults to **`all`** — the frontend's CSVs
@@ -186,7 +201,9 @@ This is the most common source of confusion in the repo.
 Used by `run.py`, `scrapy crawl maxpreps`, `backfill_all.py`.
 
 - **SQLite is the source of truth.** `INSERT OR REPLACE`, committed every 100 rows.
-  PKs: `schools(school_id)`, `games(school_id, schedule_url, game_index)`.
+  PKs: `schools(school_id)`, `games(school_id, schedule_url, game_index)`,
+  `roster(school_id, roster_url, row_index)` — `roster_url` is what keeps a player row and
+  a staff row (and one level's staff from another's) off each other's key.
 - CSV is appended live and **resume-safe** (opens `"a"` when the file is non-empty).
 - On `close_spider`, `export_db()` regenerates clean, de-duplicated CSV **and**
   streaming JSON arrays **from the DB**.
@@ -194,7 +211,8 @@ Used by `run.py`, `scrapy crawl maxpreps`, `backfill_all.py`.
   add a later-introduced field, so it `ALTER TABLE ADD COLUMN`s anything missing.
   **This is what lets `backfill_all.py` re-crawl against an old `maxpreps.db`.**
 
-Files: `output/schools.{csv,json}`, `output/schedule.{csv,json}`, `output/maxpreps.db`.
+Files: `output/schools.{csv,json}`, `output/schedule.{csv,json}`,
+`output/roster.{csv,json}` (header-only unless `-a rosters=1`), `output/maxpreps.db`.
 
 Because writes are `INSERT OR REPLACE` on a PK, **re-crawling can only add or update
 rows, never delete.** `backfill_all.py` relies on this and logs a regression tripwire
@@ -204,13 +222,15 @@ if a per-state count ever decreases.
 
 Used by `api.py` → `worker.py` → `run_crawl()`.
 
-- Writes **only** `max_prep_School.csv` + `max_prep_schedule.csv`, in `"w"` mode.
+- Writes **only** `max_prep_School.csv` + `max_prep_schedule.csv` +
+  `max_prep_roster.csv`, in `"w"` mode. (The class is still named `MaxPrepTwoFilePipeline`;
+  it writes three.)
 - **No SQLite, no JSON, no canonical files.** `run_crawl()` swaps `ITEM_PIPELINES`
   wholesale so nothing can leak into the canonical store.
 - Sets `JOBDIR` inside the per-job `output_dir` so the pending-request queue spills to
   disk instead of OOMing the box (keeps a crawl at ~55–70 MB observed).
 
-**Column contract:** both pipelines write `SCHOOL_FIELDS` / `GAME_FIELDS` from
+**Column contract:** both pipelines write `SCHOOL_FIELDS` / `GAME_FIELDS` / `ROSTER_FIELDS` from
 `maxpreps_scraper/export.py`. If you add an item field, add it there too or it
 silently won't reach any CSV (`extrasaction="ignore"`).
 
@@ -221,8 +241,8 @@ silently won't reach any CSV (`extrasaction="ignore"`).
 ```
 POST   /scrape             → Popen(worker.py …); JOBS[id] = {status, started_at, proc}
 GET    /scrape/{id}        → _refresh_status() reconciles proc.poll()
-GET    /scrape/{id}/results?type=teams|schedule  → CSV rows as JSON
-GET    /scrape/{id}/download?type=teams|schedule → FileResponse
+GET    /scrape/{id}/results?type=teams|schedule|roster  → CSV rows as JSON
+GET    /scrape/{id}/download?type=teams|schedule|roster → FileResponse
 DELETE /scrape/{id}        → terminate + rmtree
 GET    /states  /sports  /health
 ```
@@ -244,11 +264,11 @@ Four layers, deliberately nested. **Any change to one must preserve the ordering
 |---|---|---|---|---|
 | Crawl (time) | `CLOSESPIDER_TIMEOUT` | 1800 | **14400** | Graceful self-close, CSV flushed, enrichment still runs |
 | Crawl (mem) | `MEMUSAGE_LIMIT_MB` | 1600 | **1600** | Graceful self-close before host OOM |
-| Enrichment | `OPPONENT_HARVEST` / `GOFAN` / `NFHS` / `OPPONENT_RESOLVE` | 1800 / 900 / 900 / 300 | same | `subprocess.run(timeout=)` → **SIGKILL** |
-| Job | `JOB_MAX_RUNTIME_SECONDS` | 6300 | **19800** | `proc.terminate()`, job → `error` |
+| Enrichment | `OPPONENT_HARVEST` / `ROSTER` / `GOFAN` / `NFHS` / `OPPONENT_RESOLVE` | 1800 / 1200 / 900 / 900 / 300 | same | `subprocess.run(timeout=)` → **SIGKILL** |
+| Job | `JOB_MAX_RUNTIME_SECONDS` | 7500 | **21600** | `proc.terminate()`, job → `error` |
 
-**Invariant: `JOB_MAX_RUNTIME_SECONDS` > `CLOSESPIDER_TIMEOUT` + 1800 + 900 + 900 + 300.**
-Deployed: 19800 > 18300, 25 min of margin. Local default: 6300 > 5700, 10 min.
+**Invariant: `JOB_MAX_RUNTIME_SECONDS` > `CLOSESPIDER_TIMEOUT` + 1800 + 1200 + 900 + 900 + 300.**
+Deployed: 21600 > 19500, 35 min of margin. Local default: 7500 > 6900, 10 min.
 If you raise any inner cap, raise the watchdog in both `api.py` and `render.yaml`.
 
 The 1800s that used to belong to the single opponent pass now belongs to `harvest`,
@@ -259,6 +279,8 @@ local default moved 5700 → 6300.
 `enrich_opponent._settings()` additionally clamps its own `CLOSESPIDER_TIMEOUT` to
 1500s (env `OPPONENT_CLOSESPIDER_TIMEOUT`) — deliberately *under* the 1800s
 subprocess kill on `harvest`, so it self-closes and writes before being killed.
+`enrich_roster._settings()` does the same at 1000s (env `ROSTER_CLOSESPIDER_TIMEOUT`)
+under its 1200s kill.
 
 ### 6.2 Memory hazard, already documented in `render.yaml`
 
@@ -281,6 +303,7 @@ Runs after the crawl, **strictly ordered** — each step feeds the next.
 | 1 | `run_crawl()` | inline | the two CSVs |
 | 2 | `_copy_name_to_original_name` | inline | `original_name` = MaxPreps `name` |
 | **2.5** | **`enrich_opponent.py harvest`** | subprocess | **appends a teams row per opponent school; writes `opponents.json`** |
+| **2.6** | **`enrich_roster.py`** | subprocess | **appends roster rows for every teams row that has none** (§7.3) |
 | 3 | `enrich_gofan_scrapy.py` | subprocess | `go_fan_ticket_url`; **overwrites** `original_name` with GoFan's spelling |
 | 4 | `enrich_nfhs.py` | subprocess | `nfhs_url` |
 | **4.5** | **`_fill_links_from_maxpreps`** | inline | **fills blank `go_fan_ticket_url` / `nfhs_url` from `maxpreps_*_url`** |
@@ -290,7 +313,9 @@ Runs after the crawl, **strictly ordered** — each step feeds the next.
 **Why the order matters:** step 5b cross-references the teams CSV's `original_name`,
 which isn't final until step 3 has run. Step 4 matches on `original_name` for the same
 reason. Step 2.5 sits *before* 3 and 4 precisely so the rows it appends get GoFan and
-NFHS links like every other row. **Do not reorder.**
+NFHS links like every other row. Step 2.6 must follow 2.5 (it needs those rows to exist)
+but is otherwise free — it writes only the roster CSV, so it cannot interact with 3/4/4.5.
+**Do not reorder.**
 
 **Why the inline steps exist:** steps 2 and 5a guarantee their columns exist on every
 row *before* the network-bound, SIGKILL-capped subprocess runs. A killed subprocess
@@ -301,6 +326,8 @@ missing from the CSV header entirely. (Steps 3 and 4 lack this guard — see §9
 
 `teams.csv`: `original_name`, `go_fan_ticket_url`, `nfhs_url`
 `schedule.csv`: `original_opponent_school_name`, `original_opponent_school_logo`
+`roster.csv`: **none** — same schema on both paths. It gains rows (§7.3), not columns,
+which is why it needs no inline prefill guard the way §9.1's columns do.
 
 (`maxpreps_gofan_url` / `maxpreps_nfhs_url` / `state_linking` are **not** in this list — they
 are canonical `SCHOOL_FIELDS`, written by the crawl itself, so they appear in `schools.csv`
@@ -414,6 +441,29 @@ Three properties worth not breaking:
 out-of-state opponent is never followed. Relaxing that gate would spend crawl budget —
 the exact resource §4.3 protects — and still wouldn't be guaranteed under truncation.
 Post-crawl, the work is bounded (one page per *unknown* opponent root) and deterministic.
+
+### 7.3 `enrich_roster.py` — the same gap, for rosters
+
+`_maybe_follow_school` gates discovery on `target_states`, so an out-of-state opponent is
+never crawled. §7.2 closes that for its *school row*; this closes it for its *roster*.
+
+- **Keyed on "has no roster rows yet", not on `discovered_via`.** That covers the
+  opponents phase 2.5 just appended AND any school whose roster fetch failed or was cut
+  short mid-crawl, so re-running is self-healing rather than a no-op or a re-do.
+- **One school page per school, then two pages per surviving sport-season.** The school
+  page is refetched because the harvest parks only `{school_id, name, logo}` in
+  `opponents.json`, not `sportSeasons`. Caching those there is an available optimisation;
+  it was skipped to leave the harvest untouched.
+- **Honours the same sport and level filters as the crawl**, passed through from
+  `worker.py`'s argv, so it can't widen the job's scope behind your back.
+- **Uses `rosterinfo.roster_rows`**, the same mapper the spider uses, so an
+  enrichment-added row is byte-compatible with a crawled one (the §10.8e rule, applied to
+  rosters).
+- **`school_name` comes from the teams row's `name`, not `original_name`** — the crawl's
+  own roster rows carry the MaxPreps name, and GoFan may later rewrite `original_name`.
+  Reading `name` keeps the column consistent across every roster row.
+- Writes atomically and **only when it added something**, so a run that finds nothing to
+  do leaves the CSV byte-identical.
 
 ---
 
@@ -587,8 +637,8 @@ distinct candidates — but still a serial stall inside the 900s budget on a big
    atomically via `tmp` + `os.replace`.
 3. **Every enriched column must exist on every row**, even when its step is killed.
    Prefill inline first (§9.1 is the outstanding violation).
-4. **Enrichment order is fixed**: `original_name` copy → opponent **harvest** → GoFan →
-   NFHS → **MaxPreps link fill** → opponent **resolve** (§7). Harvest must precede
+4. **Enrichment order is fixed**: `original_name` copy → opponent **harvest** →
+   **roster** → GoFan → NFHS → **MaxPreps link fill** → opponent **resolve** (§7). Harvest must precede
    GoFan/NFHS so the rows it adds get enriched; the link fill must follow them because they
    write their column unconditionally; resolve must follow GoFan because it matches on the
    final `original_name`.
@@ -609,11 +659,16 @@ distinct candidates — but still a serial stall inside the 900s budget on a big
     (`/utility/about_pseudo_schools.aspx`) — there is no school behind either.
 8e. **One `pageProps` → `SCHOOL_FIELDS` mapper** (`schoolinfo.school_row`). The spider and
     the opponent harvest both call it, so an `opponent:schedule` row is structurally
-    identical to a `directory:` one. Don't reintroduce a second copy.
+    identical to a `directory:` one. Don't reintroduce a second copy. Same rule for
+    `rosterinfo.roster_rows`, shared by the spider and `enrich_roster.py`.
+8f. **Rosters stay opt-in on the canonical path** (§4.4). They cost two pages per
+    team-season; turning them on by default in the bare spider silently triples
+    `run.py` / `backfill_all.py` and costs school coverage under truncation.
 9. **Canonical writes are additive** (`INSERT OR REPLACE` on a PK). Never delete rows;
    `backfill_all.py`'s no-regression guarantee depends on it.
 10. **New item field ⇒ add it to `export.py`'s field lists**, or it silently never
-    reaches a CSV.
+    reaches a CSV. The reverse also bites: a name in a field list with no matching
+    `scrapy.Field()` raises `KeyError` when the spider constructs the item.
 
 ---
 
@@ -626,6 +681,7 @@ source .venv/bin/activate            # Python 3.9.6
 python run.py wy                     # one state
 python run.py wy,vt,ri               # a few
 python run.py wy --no-schedules      # schools + sports only (fast)
+python run.py wy -a rosters=1        # ALSO crawl Roster + Staff tabs (~3x the pages)
 python run.py all --levels all       # everything incl. JV/Freshman
 scrapy crawl maxpreps -a states=ny -s JOBDIR=.jobs/ny     # resumable
 
@@ -650,6 +706,7 @@ python worker.py /tmp/wyjob wy Football all 1        # argv: out_dir states spor
 # --- enrichment steps standalone ---
 python enrich_gofan_scrapy.py output/max_prep_School.csv [--refresh]
 python enrich_nfhs.py         output/max_prep_School.csv [--refresh]
+python enrich_roster.py   output/max_prep_roster.csv output/max_prep_School.csv Football all
 python enrich_opponent.py         output/max_prep_schedule.csv output/max_prep_School.csv
 python enrich_opponent.py harvest output/max_prep_schedule.csv output/max_prep_School.csv
 python enrich_opponent.py resolve output/max_prep_schedule.csv output/max_prep_School.csv
@@ -691,6 +748,8 @@ best done locally with `backfill_all.py`, which is fully uncapped.
 | Change matching accuracy | `enrich_gofan.py::Matcher` (shared shape with `enrich_nfhs.py`) |
 | Empty / identical `maxpreps_*_url` | `scripts/probe_partner_links.py` first, then `schoolinfo.PARTNERS` (§7.1b) |
 | Fix an opponent name/logo bug | `enrich_opponent.py` — `resolve()` first, then `NameIndex` / `school_from_crumbs` |
+| Empty / wrong roster rows | `maxpreps_scraper/rosterinfo.py` — `CATEGORIES` anchors and the header→field map |
+| A school with no roster rows | `enrich_roster.py` — `RosterSpider.__init__`'s `to_fetch` selection, §7.3 |
 | Fix a missing opponent school row | `enrich_opponent.py` — `HarvestSpider` / `opponent_roots()`, §7.2 |
 | Change API shape | `api.py`; note the `FILENAMES` coupling to `MaxPrepTwoFilePipeline` |
 | Tune crawl politeness/limits | `maxpreps_scraper/settings.py` + `render.yaml` env vars |

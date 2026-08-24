@@ -9,8 +9,8 @@ Usage (invoked by api.py, not by hand):
 
     python worker.py <output_dir> <states> <sports> <levels> <discover>
 
-    output_dir  directory the two CSVs are written to (max_prep_School.csv,
-                max_prep_schedule.csv)
+    output_dir  directory the three CSVs are written to (max_prep_School.csv,
+                max_prep_schedule.csv, max_prep_roster.csv)
     states      comma-separated state codes, e.g. "ny" or "ny,ca,tx"
     sports      comma-separated sport names, e.g. "Football" or "Football,Basketball"
     levels      "all" (default: Varsity + JV + Freshman) or e.g. "Varsity"
@@ -42,6 +42,13 @@ NFHS_TIMEOUT_SECONDS = 900
 # be reflected in JOB_MAX_RUNTIME_SECONDS (api.py / render.yaml), which has to exceed the sum
 # of every cap.
 OPPONENT_HARVEST_TIMEOUT_SECONDS = 1800
+
+# Hard cap on the ROSTER enrichment (seconds). It fetches the school page plus a Roster and
+# a Staff page for every teams-CSV school that has no roster rows yet -- in practice the
+# opponent schools phase 2.5 just appended, which the crawl's state gate never visited. On
+# timeout the roster CSV keeps exactly the rows the crawl itself wrote (the append is
+# atomic and only happens on a clean close), so it stays complete and usable.
+ROSTER_TIMEOUT_SECONDS = 1200
 
 # Hard cap on the opponent RESOLVE (seconds). Pure CSV work off the harvest's cache -- no
 # requests -- so this is generous. On timeout the schedule CSV keeps the fallback columns
@@ -199,6 +206,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     teams_csv = os.path.join(output_dir, "max_prep_School.csv")
     schedule_csv = os.path.join(output_dir, "max_prep_schedule.csv")
+    roster_csv = os.path.join(output_dir, "max_prep_roster.csv")
     have_both = os.path.exists(teams_csv) and os.path.exists(schedule_csv)
 
     if os.path.exists(teams_csv):
@@ -220,6 +228,15 @@ def main():
         _step("opponent harvest",
               ["enrich_opponent.py", "harvest", schedule_csv, teams_csv],
               OPPONENT_HARVEST_TIMEOUT_SECONDS, here)
+
+    # Phase 2.6: give every school in the teams CSV roster rows. Same gap as phase 2.5 and
+    # for the same reason -- the crawl never visits an out-of-state opponent, so the rows
+    # harvest just appended have no roster. Must run AFTER 2.5 so those rows exist. Writes
+    # only the roster CSV, so it cannot interfere with phases 3/4/4.5.
+    if os.path.exists(roster_csv) and os.path.exists(teams_csv):
+        _step("roster enrichment",
+              ["enrich_roster.py", roster_csv, teams_csv, sports, levels],
+              ROSTER_TIMEOUT_SECONDS, here)
 
     if os.path.exists(teams_csv):
         # Phase 3: match each school against GoFan's catalog (state + city gated),

@@ -30,6 +30,14 @@ GAME_FIELDS = [
     "game_index", "date", "home_away", "opponent", "opponent_url",
     "result", "score", "game_info", "schedule_url",
 ]
+# One row per person on a team's Roster or Staff tab. The leading block mirrors
+# GAME_FIELDS so the three CSVs join on the same keys; "category" says which tab the
+# row came from ("player" / "staff"), and the player-only columns are blank for staff.
+ROSTER_FIELDS = [
+    "school_id", "school_name", "state", "sport", "gender", "season", "level",
+    "category", "row_index", "jersey_number", "name", "grade", "position",
+    "height", "weight", "roster_url",
+]
 LIST_FIELDS = {"sports"}  # stored as "a; b; c" text in SQLite -> list in JSON
 
 
@@ -55,7 +63,10 @@ def _export_table(db, table, fields, csv_path, json_path):
 
 
 def export_db(output_dir="output", db_file="maxpreps.db"):
-    """Rebuild schools.{csv,json} and schedule.{csv,json} from the SQLite DB."""
+    """Rebuild schools/schedule/roster {csv,json} from the SQLite DB.
+
+    Returns ``(n_schools, n_games, n_roster)``.
+    """
     db_path = os.path.join(output_dir, db_file)
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"No database at {db_path}")
@@ -71,12 +82,18 @@ def export_db(output_dir="output", db_file="maxpreps.db"):
             os.path.join(output_dir, "schedule.csv"),
             os.path.join(output_dir, "schedule.json"),
         )
+        n_roster = _export_table(
+            db, "roster", ROSTER_FIELDS,
+            os.path.join(output_dir, "roster.csv"),
+            os.path.join(output_dir, "roster.json"),
+        )
     finally:
         db.close()
-    return n_schools, n_games
+    return n_schools, n_games, n_roster
 
 
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "output"
-    s, g = export_db(out)
-    print(f"Exported {s} schools and {g} games from {out}/maxpreps.db -> CSV + JSON")
+    s, g, r = export_db(out)
+    print(f"Exported {s} schools, {g} games and {r} roster rows "
+          f"from {out}/maxpreps.db -> CSV + JSON")

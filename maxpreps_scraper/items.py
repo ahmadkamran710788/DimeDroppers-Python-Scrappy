@@ -1,11 +1,16 @@
 """Scrapy item definitions.
 
-Two record types flow through the pipeline:
+Three record types flow through the pipeline:
 
 * ``SchoolItem``        -> one row per high school (with its list of sports)
 * ``ScheduleGameItem``  -> one row per game on a team's schedule
+* ``RosterItem``        -> one row per player/staff member on a team's roster
 
-Field order here is also the column order used in the CSV output.
+The CSV column order is ``export.py``'s ``SCHOOL_FIELDS`` / ``GAME_FIELDS`` /
+``ROSTER_FIELDS``, NOT the field order declared here -- every writer builds its row by
+iterating those lists with ``extrasaction="ignore"``. Declaring a field here that is
+absent from the matching list silently drops it from every sink; the reverse (a name in
+the list with no field here) raises ``KeyError`` when the spider constructs the item.
 """
 import scrapy
 
@@ -82,3 +87,25 @@ class ScheduleGameItem(scrapy.Item):
     result = scrapy.Field()       # W / L / T / "" (scheduled)
     score = scrapy.Field()
     game_info = scrapy.Field()    # raw text of the "Game Info" cell
+
+
+class RosterItem(scrapy.Item):
+    # which team/season this person belongs to (same block as ScheduleGameItem)
+    school_id = scrapy.Field()
+    school_name = scrapy.Field()
+    state = scrapy.Field()
+    sport = scrapy.Field()
+    gender = scrapy.Field()
+    season = scrapy.Field()
+    level = scrapy.Field()          # Varsity / JV / Freshman
+    roster_url = scrapy.Field()
+
+    # the person
+    category = scrapy.Field()       # "player" (Roster tab) / "staff" (Staff tab)
+    row_index = scrapy.Field()      # position within their table
+    jersey_number = scrapy.Field()  # the "#" column; blank for staff
+    name = scrapy.Field()           # the "Player" / "Staff" column
+    grade = scrapy.Field()          # So. / Jr. / Sr. ...; blank for staff
+    position = scrapy.Field()       # "WR", "SS, FS" / "Assistant Coach"
+    height = scrapy.Field()         # as displayed (6'0"); blank for staff
+    weight = scrapy.Field()         # as displayed (178 lbs); blank for staff

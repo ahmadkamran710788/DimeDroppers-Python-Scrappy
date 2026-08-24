@@ -6,8 +6,8 @@ cannot be restarted in-process, so this service uses an async **job** model:
 
     POST /scrape                      -> { job_id, status: "running" }   (starts a crawl)
     GET  /scrape/{job_id}             -> { status, counts, error? }      (poll)
-    GET  /scrape/{job_id}/results     -> [ {...}, ... ]   ?type=teams|schedule
-    GET  /scrape/{job_id}/download    -> CSV file         ?type=teams|schedule
+    GET  /scrape/{job_id}/results     -> [ {...}, ... ]   ?type=teams|schedule|roster
+    GET  /scrape/{job_id}/download    -> CSV file         ?type=teams|schedule|roster
     DELETE /scrape/{job_id}           -> { deleted: true }  (frontend calls after download)
     GET  /states                      -> [ { code, name }, ... ]
     GET  /sports                      -> [ "Football", ... ]
@@ -35,19 +35,25 @@ from maxpreps_scraper.states import STATES
 # Config
 # --------------------------------------------------------------------------- #
 JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs")
-# Pipeline (MaxPrepTwoFilePipeline) always writes these two filenames:
-FILENAMES = {"teams": "max_prep_School.csv", "schedule": "max_prep_schedule.csv"}
+# Pipeline (MaxPrepTwoFilePipeline) always writes these filenames:
+FILENAMES = {
+    "teams": "max_prep_School.csv",
+    "schedule": "max_prep_schedule.csv",
+    "roster": "max_prep_roster.csv",
+}
+# ?type= accepts exactly the keys above.
+RESULT_TYPES = f"^({'|'.join(FILENAMES)})$"
 # Cap simultaneous crawls so a burst of requests can't exhaust the instance.
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
 # Wall-clock backstop: a job 'running' longer than this is treated as failed, so a
 # crashed/hung crawl can never pin a concurrency slot forever. This is a LAST RESORT --
 # the crawl bounds itself first (settings.CLOSESPIDER_TIMEOUT) and so does each enrichment
-# step (worker.py's harvest/GoFan/NFHS/resolve timeouts). Keep this above their sum so a
-# legitimate long job is never killed mid-run.
-#   deployed (render.yaml): 14400 + 1800 + 900 + 900 + 300 = 18300  vs  19800  (1500 margin)
-#   local default:           1800 + 1800 + 900 + 900 + 300 =  5700  vs   6300  ( 600 margin)
+# step (worker.py's harvest/roster/GoFan/NFHS/resolve timeouts). Keep this above their sum
+# so a legitimate long job is never killed mid-run.
+#   deployed (render.yaml): 14400 + 1800 + 1200 + 900 + 900 + 300 = 19500 vs 21600 (2100 margin)
+#   local default:           1800 + 1800 + 1200 + 900 + 900 + 300 =  6900 vs  7500 ( 600 margin)
 # If you add or raise an enrichment cap in worker.py, raise this and render.yaml with it.
-JOB_MAX_RUNTIME_SECONDS = int(os.environ.get("JOB_MAX_RUNTIME_SECONDS", "6300"))
+JOB_MAX_RUNTIME_SECONDS = int(os.environ.get("JOB_MAX_RUNTIME_SECONDS", "7500"))
 # Common high-school sports as MaxPreps labels them (for the frontend dropdown).
 COMMON_SPORTS = [
     "Football", "Basketball", "Baseball", "Softball", "Soccer", "Volleyball",
@@ -226,10 +232,7 @@ def scrape_status(job_id: str):
     job = _refresh_status(job_id)
     counts = None
     if job["status"] == "done":
-        counts = {
-            "teams": _count_rows(_csv_path(job_id, "teams")),
-            "schedule": _count_rows(_csv_path(job_id, "schedule")),
-        }
+        counts = {kind: _count_rows(_csv_path(job_id, kind)) for kind in FILENAMES}
     return {
         "job_id": job_id,
         "status": job["status"],
@@ -241,7 +244,7 @@ def scrape_status(job_id: str):
 
 
 @app.get("/scrape/{job_id}/results")
-def scrape_results(job_id: str, type: str = Query("teams", pattern="^(teams|schedule)$")):
+def scrape_results(job_id: str, type: str = Query("teams", pattern=RESULT_TYPES)):
     if job_id not in JOBS:
         raise HTTPException(404, "unknown job_id")
     job = _refresh_status(job_id)
@@ -251,7 +254,7 @@ def scrape_results(job_id: str, type: str = Query("teams", pattern="^(teams|sche
 
 
 @app.get("/scrape/{job_id}/download")
-def scrape_download(job_id: str, type: str = Query("teams", pattern="^(teams|schedule)$")):
+def scrape_download(job_id: str, type: str = Query("teams", pattern=RESULT_TYPES)):
     if job_id not in JOBS:
         raise HTTPException(404, "unknown job_id")
     job = _refresh_status(job_id)
@@ -260,8 +263,7 @@ def scrape_download(job_id: str, type: str = Query("teams", pattern="^(teams|sch
     path = _csv_path(job_id, type)
     if not os.path.exists(path):
         raise HTTPException(404, f"no {type} file for this job")
-    filename = "teams.csv" if type == "teams" else "schedule.csv"
-    return FileResponse(path, media_type="text/csv", filename=filename)
+    return FileResponse(path, media_type="text/csv", filename=f"{type}.csv")
 
 
 @app.delete("/scrape/{job_id}")
