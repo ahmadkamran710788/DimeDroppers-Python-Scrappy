@@ -17,13 +17,21 @@ Usage (invoked by middle_school_api.py, not by hand):
 Two phases, two outputs:
 
   Phase 1 -> gofan_schools.csv    every column of the uploaded CSV, unchanged, plus
-                                  eight gofan_* columns naming the matched school.
+                                  nine gofan_* columns naming the matched school.
   Phase 2 -> gofan_schedule.csv   one row per upcoming GoFan event, for every school
                                   phase 1 matched.
 
-Unlike a MaxPreps crawl, the amount of work is known before it starts (it is just the
-row count), so this writes a real ``progress.json`` and the UI can show a true
-progress bar instead of indeterminate dots.
+**Both phases stream.** Rows are read, enriched and written a chunk at a time, and
+nothing is ever accumulated across the whole file, so peak memory is set by CHUNK_ROWS
+(a few MB) rather than by the row count. An earlier version read the whole CSV into a
+list, which cost ~12 MB per 1,000 rows -- fine for 16k rows, but ~1.2 GB at 100k and an
+OOM kill beyond that. Row count is now bounded only by disk and wall-clock.
+
+Unlike a MaxPreps crawl, the amount of work is known before it starts, so this writes a
+real ``progress.json`` and the UI can show a true progress bar. That file is also the
+job's liveness signal: the API watches it advance and kills only a genuinely stalled
+job, rather than capping total runtime -- which is what lets an arbitrarily large file
+run to completion.
 
 Exit code 0 = finished; non-zero = failed (the API marks the job "error").
 """
@@ -33,6 +41,7 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 
 import gofan_client
 from gofan_match import pick
@@ -52,14 +61,22 @@ csv.field_size_limit(10**7)
 # Concurrency for the GoFan calls. 8 measured ~106 ms/row end-to-end with zero 429s;
 # the API is the bottleneck, not the CPU, so this is I/O-bound and threads are right.
 WORKERS = 8
-# How often to flush progress.json. Small enough that the UI feels live, large enough
-# that we aren't doing a write per row.
+# Rows held in memory at once. The only thing that grows with file size is the set of
+# matched school ids (phase 2's work list), which is a few bytes per matched school.
+CHUNK_ROWS = 500
+# Schools per schedule batch. Smaller than CHUNK_ROWS because each one can return
+# hundreds of events, which are written out and dropped immediately after.
+CHUNK_SCHOOLS = 100
+# Heartbeat granularity, in completed items. This is deliberately far finer than a
+# chunk: progress.json doubles as the job's liveness signal, and if it only advanced
+# once per 500-row chunk then a chunk slowed by GoFan retries could sit still long
+# enough to look stalled and be killed mid-run. It also keeps the UI progress bar
+# moving smoothly on a multi-hour job instead of jumping a chunk at a time.
 PROGRESS_EVERY = 25
 
-# Columns appended to the uploaded CSV. Pre-filled to "" for every row BEFORE any
-# work starts, so a killed job still leaves a CSV whose header has them -- the
-# frontend sees blanks rather than `undefined` (see ARCHITECTURE.md's note on the
-# GoFan/NFHS steps that get this wrong).
+# Columns appended to the uploaded CSV. Every row is written with all of them present
+# (blank when unmatched), so a job killed midway still leaves a valid CSV whose header
+# is complete -- the frontend sees blanks rather than `undefined`.
 GOFAN_COLUMNS = [
     "gofan_url",
     "gofan_school_id",
@@ -91,7 +108,11 @@ GAME_FIELDS = [
 # Progress
 # --------------------------------------------------------------------------- #
 def _write_progress(job_dir, **fields):
-    """Write progress.json atomically so a poll never reads a half-written file."""
+    """Write progress.json atomically so a poll never reads a half-written file.
+
+    The API treats a change in ``done`` as proof the job is alive, so this must keep
+    being called throughout both phases even when nothing interesting has happened.
+    """
     path = os.path.join(job_dir, PROGRESS_JSON)
     tmp = path + ".tmp"
     try:
@@ -100,6 +121,34 @@ def _write_progress(job_dir, **fields):
         os.replace(tmp, path)
     except OSError:
         pass  # progress is advisory; never fail the job over it
+
+
+def _chunks(iterable, size):
+    """Yield lists of at most ``size`` items from an iterator, lazily."""
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, size))
+        if not batch:
+            return
+        yield batch
+
+
+def count_rows(path, limit=0):
+    """Count data rows without building dicts.
+
+    Needed up front so the progress bar has a denominator. Uses csv.reader rather than
+    counting newlines because quoted NCES fields can contain embedded newlines, which
+    would inflate a naive line count. One extra read of the file, ~1s per 100k rows.
+    """
+    total = 0
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        next(reader, None)  # header
+        for _ in reader:
+            total += 1
+            if limit and total >= limit:
+                break
+    return total
 
 
 # --------------------------------------------------------------------------- #
@@ -130,52 +179,71 @@ def _resolve(row):
 
 
 def link_schools(job_dir, input_csv, limit):
-    """Phase 1: add the gofan_* columns to the uploaded CSV. Returns the rows."""
-    with open(input_csv, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        fieldnames = list(reader.fieldnames or [])
-        rows = []
-        for row in reader:
-            rows.append(row)
-            if limit and len(rows) >= limit:
-                break
+    """Phase 1, streaming: add the gofan_* columns to the uploaded CSV.
 
-    if "SCH_NAME" not in fieldnames:
-        raise SystemExit("uploaded CSV has no SCH_NAME column")
-
-    # Idempotent column addition, matching the idiom used across this repo.
-    out_fields = fieldnames + [c for c in GOFAN_COLUMNS if c not in fieldnames]
-    for row in rows:
-        for c in GOFAN_COLUMNS:
-            row.setdefault(c, "")
-        row["gofan_match"] = "none"
-
-    total = len(rows)
-    done = matched = 0
+    Returns ``(total_rows, matched, work_list)`` where work_list is the de-duplicated
+    set of matched schools phase 2 has to fetch. That list is the only thing carried
+    across phases, and it holds a handful of short strings per *matched* school -- not
+    per input row -- so it stays small even on a very large upload.
+    """
+    total = count_rows(input_csv, limit)
+    out_path = os.path.join(job_dir, SCHOOLS_CSV)
     _write_progress(job_dir, phase="link", done=0, total=total, matched=0, events=0)
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for row, result in zip(rows, pool.map(_resolve, rows)):
-            row.update(result)
-            done += 1
-            if result.get("gofan_school_id"):
-                matched += 1
-            if done % PROGRESS_EVERY == 0 or done == total:
-                _write_progress(
-                    job_dir, phase="link", done=done, total=total,
-                    matched=matched, events=0,
-                )
+    done = matched = 0
+    work_list, seen = [], set()
 
-    path = os.path.join(job_dir, SCHOOLS_CSV)
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=out_fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    os.replace(tmp, path)
+    with open(input_csv, newline="", encoding="utf-8-sig") as fin:
+        reader = csv.DictReader(fin)
+        fieldnames = list(reader.fieldnames or [])
+        if "SCH_NAME" not in fieldnames:
+            raise SystemExit("uploaded CSV has no SCH_NAME column")
+        # Idempotent column addition, matching the idiom used across this repo.
+        out_fields = fieldnames + [c for c in GOFAN_COLUMNS if c not in fieldnames]
 
-    print(f"phase 1: {total} rows | matched {matched} | -> {path}", flush=True)
-    return rows, matched
+        rows = islice(reader, limit) if limit else reader
+
+        # Written progressively rather than atomically at the end: at 100k+ rows the
+        # whole point is never to hold the result in memory, and a partially-written
+        # CSV is strictly more useful than none if the job dies.
+        with open(out_path, "w", newline="", encoding="utf-8") as fout:
+            writer = csv.DictWriter(fout, fieldnames=out_fields, extrasaction="ignore")
+            writer.writeheader()
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                for chunk in _chunks(rows, CHUNK_ROWS):
+                    # pool.map yields in order as results arrive, so `done` advances
+                    # row by row rather than only when the whole chunk lands.
+                    for row, result in zip(chunk, pool.map(_resolve, chunk)):
+                        row.update(result)
+                        sid = result.get("gofan_school_id")
+                        if sid:
+                            matched += 1
+                            if sid not in seen:
+                                seen.add(sid)
+                                work_list.append({
+                                    "gofan_school_id": sid,
+                                    "gofan_name": result.get("gofan_name") or "",
+                                    "sch_name": row.get("SCH_NAME") or "",
+                                    "nces_school_id": row.get("NCESSCH") or "",
+                                    "state": row.get("MSTATE") or row.get("ST") or "",
+                                    "city": row.get("MCITY") or "",
+                                })
+                        done += 1
+                        if done % PROGRESS_EVERY == 0:
+                            _write_progress(
+                                job_dir, phase="link", done=done, total=total,
+                                matched=matched, events=0,
+                            )
+                    writer.writerows(chunk)
+                    fout.flush()
+                    _write_progress(
+                        job_dir, phase="link", done=done, total=total,
+                        matched=matched, events=0,
+                    )
+
+    print(f"phase 1: {done} rows | matched {matched} | -> {out_path}", flush=True)
+    return done, matched, work_list
 
 
 # --------------------------------------------------------------------------- #
@@ -220,7 +288,11 @@ def _levels(event):
             if g and g not in genders:
                 genders.append(str(g))
     if not genders:
-        genders = [str(g) for g in (event.get("resolvedGenders") or event.get("genders") or []) if g]
+        genders = [
+            str(g)
+            for g in (event.get("resolvedGenders") or event.get("genders") or [])
+            if g
+        ]
     return "; ".join(dict.fromkeys(names)), "; ".join(dict.fromkeys(genders))
 
 
@@ -228,7 +300,9 @@ def _min_price(event):
     prices = [
         t.get("price")
         for t in (event.get("ticketTypes") or [])
-        if isinstance(t, dict) and t.get("isEnabled") and isinstance(t.get("price"), (int, float))
+        if isinstance(t, dict)
+        and t.get("isEnabled")
+        and isinstance(t.get("price"), (int, float))
     ]
     return f"{min(prices):.2f}" if prices else ""
 
@@ -244,7 +318,11 @@ def _event_row(school, event, index, names):
         opp_id = event.get("opponentSchoolId") or ""
         opponent = (names.get(opp_id) or {}).get("name") or ""
     else:
-        opponent = event.get("financialSchoolName") or (names.get(host_id) or {}).get("name") or ""
+        opponent = (
+            event.get("financialSchoolName")
+            or (names.get(host_id) or {}).get("name")
+            or ""
+        )
 
     date, time_, raw, tz = _local_parts(event)
     level, gender = _levels(event)
@@ -259,7 +337,9 @@ def _event_row(school, event, index, names):
         "gofan_school_id": sid,
         "gofan_school_name": school["gofan_name"],
         "gofan_url": gofan_client.SCHOOL_URL.format(sid),
-        "sport": (event.get("activity") or {}).get("name") or event.get("eventTypeName") or "",
+        "sport": (event.get("activity") or {}).get("name")
+        or event.get("eventTypeName")
+        or "",
         # A school's GoFan page also sells non-game items (season pass cards, theatre,
         # registration). They are real rows on that page, so they are not dropped --
         # this flag lets a consumer filter to games without losing anything.
@@ -287,71 +367,73 @@ def _event_row(school, event, index, names):
     }
 
 
-def scrape_schedules(job_dir, rows, total_rows, matched):
-    """Phase 2: one CSV row per upcoming event, for every matched school."""
-    # One entry per distinct GoFan school -- several uploaded rows can legitimately
-    # resolve to the same GoFan page, and we must not fetch or emit it twice.
-    schools, seen = [], set()
-    for row in rows:
-        sid = (row.get("gofan_school_id") or "").strip()
-        if not sid or sid in seen:
-            continue
-        seen.add(sid)
-        schools.append({
-            "gofan_school_id": sid,
-            "gofan_name": row.get("gofan_name") or "",
-            "sch_name": row.get("SCH_NAME") or "",
-            "nces_school_id": row.get("NCESSCH") or "",
-            "state": row.get("MSTATE") or row.get("ST") or "",
-            "city": row.get("MCITY") or "",
-        })
-
-    total = len(schools)
+def scrape_schedules(job_dir, work_list, total_rows, matched):
+    """Phase 2, streaming: one CSV row per upcoming event, for every matched school."""
+    total = len(work_list)
+    out_path = os.path.join(job_dir, SCHEDULE_CSV)
     _write_progress(
         job_dir, phase="schedule", done=0, total=total,
         matched=matched, events=0, rows=total_rows,
     )
 
-    fetched, done = [], 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for school, events in zip(
-            schools, pool.map(lambda s: gofan_client.school_events(s["gofan_school_id"]), schools)
-        ):
-            fetched.append((school, events))
-            done += 1
-            if done % PROGRESS_EVERY == 0 or done == total:
+    # id -> detail, for naming opponents on home games. Grows with the number of
+    # *distinct* schools seen, not events, and is only ever added to once per id.
+    names = {}
+    done = written = 0
+
+    with open(out_path, "w", newline="", encoding="utf-8") as fout:
+        writer = csv.DictWriter(fout, fieldnames=GAME_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            for batch in _chunks(work_list, CHUNK_SCHOOLS):
+                fetched = []
+                for school, events in zip(
+                    batch,
+                    pool.map(
+                        lambda s: gofan_client.school_events(s["gofan_school_id"]),
+                        batch,
+                    ),
+                ):
+                    fetched.append((school, events))
+                    done += 1
+                    if done % PROGRESS_EVERY == 0:
+                        # Heartbeat during the fetch too -- a batch of 100 schools is
+                        # minutes of network on its own.
+                        _write_progress(
+                            job_dir, phase="schedule", done=done, total=total,
+                            matched=matched, events=written, rows=total_rows,
+                        )
+
+                # Resolve this batch's unseen opponent ids in one POST, then write and
+                # drop the events. Batching per chunk (rather than once globally at the
+                # end) is what keeps events from piling up in memory.
+                wanted = {
+                    ev[key]
+                    for _, events in fetched
+                    for ev in events
+                    for key in ("schoolHuddleId", "opponentSchoolId")
+                    if ev.get(key) and ev[key] not in names
+                }
+                if wanted:
+                    names.update(gofan_client.schools_by_ids(sorted(wanted)))
+
+                for school, events in fetched:
+                    for i, ev in enumerate(
+                        sorted(events, key=lambda e: e.get("startDateTime") or ""),
+                        start=1,
+                    ):
+                        writer.writerow(_event_row(school, ev, i, names))
+                        written += 1
+
+                fout.flush()
                 _write_progress(
                     job_dir, phase="schedule", done=done, total=total,
-                    matched=matched, events=sum(len(e) for _, e in fetched), rows=total_rows,
+                    matched=matched, events=written, rows=total_rows,
                 )
 
-    # Resolve every referenced school id to a name in one bulk call, so opponents on
-    # home games aren't left blank. Cheap: one POST per 1,000 ids.
-    wanted = set()
-    for _, events in fetched:
-        for ev in events:
-            for key in ("schoolHuddleId", "opponentSchoolId"):
-                if ev.get(key):
-                    wanted.add(ev[key])
-    names = gofan_client.schools_by_ids(sorted(wanted)) if wanted else {}
-
-    out_rows = []
-    for school, events in fetched:
-        for i, ev in enumerate(
-            sorted(events, key=lambda e: e.get("startDateTime") or ""), start=1
-        ):
-            out_rows.append(_event_row(school, ev, i, names))
-
-    path = os.path.join(job_dir, SCHEDULE_CSV)
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=GAME_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(out_rows)
-    os.replace(tmp, path)
-
-    print(f"phase 2: {total} schools | {len(out_rows)} events | -> {path}", flush=True)
-    return len(out_rows)
+    print(f"phase 2: {total} schools | {written} events | -> {out_path}", flush=True)
+    return written
 
 
 # --------------------------------------------------------------------------- #
@@ -366,12 +448,12 @@ def main():
     limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
     os.makedirs(job_dir, exist_ok=True)
 
-    rows, matched = link_schools(job_dir, input_csv, limit)
-    events = scrape_schedules(job_dir, rows, len(rows), matched)
+    total_rows, matched, work_list = link_schools(job_dir, input_csv, limit)
+    events = scrape_schedules(job_dir, work_list, total_rows, matched)
 
     _write_progress(
-        job_dir, phase="done", done=len(rows), total=len(rows),
-        matched=matched, events=events, rows=len(rows),
+        job_dir, phase="done", done=total_rows, total=total_rows,
+        matched=matched, events=events, rows=total_rows,
     )
 
 

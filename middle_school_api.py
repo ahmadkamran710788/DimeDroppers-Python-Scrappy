@@ -36,21 +36,38 @@ MS_JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ms_jobs"
 FILENAMES = {"schools": SCHOOLS_CSV, "schedule": SCHEDULE_CSV}
 RESULT_TYPES = f"^({'|'.join(FILENAMES)})$"
 
-# One at a time. A run is ~35 min of steady outbound requests to GoFan; two in
-# parallel would double our request rate against them for no throughput gain, since
-# the worker is already saturating its own concurrency budget.
+# One at a time. A run is steady outbound requests to GoFan for as long as it takes,
+# and the worker already saturates its own concurrency budget, so a second parallel job
+# would double our request rate against GoFan for no throughput gain.
 MAX_CONCURRENT = int(os.environ.get("MS_MAX_CONCURRENT_JOBS", "1"))
-# Wall-clock backstop, independent of api.py's JOB_MAX_RUNTIME_SECONDS. A full
-# 16,655-row run measured ~35 min; 90 min leaves room for a slow day at GoFan.
-MAX_RUNTIME_SECONDS = int(os.environ.get("MS_JOB_MAX_RUNTIME_SECONDS", "5400"))
+
+# Liveness, not a runtime budget.
+#
+# There is deliberately NO total-runtime cap. Runtime here scales linearly with the
+# uploaded row count (~106 ms/row), so any fixed ceiling silently becomes a row-count
+# ceiling: the old 5400s limit killed anything past ~44k rows mid-run, and the user
+# just saw a job "fail" with no reason. Instead the worker heartbeats progress.json
+# after every chunk, and a job is failed only when that heartbeat stops advancing --
+# which is what a hung job actually looks like, at any file size.
+#
+# The window must comfortably exceed the slowest single chunk. A chunk is 500 rows
+# (phase 1) or 100 schools (phase 2); with GoFan's retry/backoff a pathological chunk
+# is still minutes, not tens of minutes. 15 min is generous.
+STALL_SECONDS = int(os.environ.get("MS_JOB_STALL_SECONDS", "900"))
+# Absolute backstop for a job that heartbeats but never finishes (0 disables). Default
+# 0: the stall detector is the real guard, and any finite value reintroduces the
+# row-count ceiling this design exists to remove.
+MAX_RUNTIME_SECONDS = int(os.environ.get("MS_JOB_MAX_RUNTIME_SECONDS", "0"))
 # The uploaded file is streamed to disk in chunks -- never read whole into memory.
 UPLOAD_CHUNK = 1024 * 1024
-MAX_UPLOAD_BYTES = int(os.environ.get("MS_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+# 1 GB. The worker streams rows now, so the file size no longer drives memory; this is
+# just a guard against a runaway upload filling the disk.
+MAX_UPLOAD_BYTES = int(os.environ.get("MS_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
 # Rows returned by /results. The full schools CSV is 23 MB+ with ~134 columns; the
 # UI only needs a preview, and the download endpoint serves the real thing.
 PREVIEW_ROWS = 500
 
-# job_id -> { status, started_at, error, filename, limit, proc }
+# job_id -> { status, started_at, error, filename, limit, proc, last_beat* }
 JOBS = {}
 
 router = APIRouter(prefix="/ms", tags=["middle-school"])
@@ -89,25 +106,59 @@ def _read_progress(job_id):
         return None
 
 
+def _stalled(job_id, job):
+    """True if the worker's progress heartbeat has stopped advancing.
+
+    Liveness is measured by the ``done`` counter in progress.json, not by elapsed time,
+    so a legitimately long run (a 100k-row upload takes hours) is never mistaken for a
+    hung one. Each observed advance resets the clock.
+    """
+    progress = _read_progress(job_id) or {}
+    beat = (progress.get("phase"), progress.get("done"))
+    now = time.time()
+    if beat != job.get("last_beat"):
+        job["last_beat"] = beat
+        job["last_beat_at"] = now
+        return False
+    # No movement yet is normal at startup: the worker counts rows before its first
+    # heartbeat, which on a very large file takes a few seconds. Fall back to
+    # started_at so the window is measured from a real point in time either way.
+    since = job.get("last_beat_at") or job.get("started_at", now)
+    return (now - since) > STALL_SECONDS
+
+
 def _refresh_status(job_id):
     """Reconcile a 'running' job with its subprocess's actual exit state."""
     job = JOBS[job_id]
     if job["status"] != "running":
         return job
+
     proc = job.get("proc")
     if proc is None:
-        if time.time() - job.get("started_at", 0) > MAX_RUNTIME_SECONDS:
+        # No live handle but still 'running' -- a job whose process we lost track of.
+        if _stalled(job_id, job):
             job["status"] = "error"
-            job["error"] = "job timed out"
+            job["error"] = "job stalled (no progress)"
         return job
+
     rc = proc.poll()
     if rc is None:
-        if time.time() - job.get("started_at", 0) > MAX_RUNTIME_SECONDS:
+        # Still executing. Fail it only if it has genuinely stopped making progress,
+        # or blown an explicitly-configured absolute ceiling (disabled by default).
+        if MAX_RUNTIME_SECONDS and (
+            time.time() - job.get("started_at", 0) > MAX_RUNTIME_SECONDS
+        ):
             proc.terminate()
             job["status"] = "error"
-            job["error"] = "job timed out"
+            job["error"] = "job exceeded MS_JOB_MAX_RUNTIME_SECONDS"
+            job["proc"] = None
+        elif _stalled(job_id, job):
+            proc.terminate()
+            job["status"] = "error"
+            job["error"] = f"job stalled (no progress for {STALL_SECONDS}s)"
             job["proc"] = None
         return job
+
     job["status"] = "done" if rc == 0 else "error"
     if rc != 0:
         job["error"] = f"worker exited with code {rc}"
@@ -201,6 +252,9 @@ async def start_gofan(file: UploadFile = File(...), limit: int = Form(0)):
         "filename": file.filename,
         "limit": max(0, limit),
         "proc": proc,
+        # Liveness bookkeeping for _stalled(); updated on every status poll.
+        "last_beat": None,
+        "last_beat_at": time.time(),
     }
     return {"job_id": job_id, "status": "running"}
 

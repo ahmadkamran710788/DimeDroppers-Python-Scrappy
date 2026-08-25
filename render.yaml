@@ -52,16 +52,23 @@ services:
       # would double our request rate against GoFan for no throughput gain.
       - key: MS_MAX_CONCURRENT_JOBS
         value: "1"
-      # Wall-clock cap per middle-school job (s). A full 16,655-row file measured ~30 min
-      # of school lookups plus ~5 min of schedule fetches; 5400 leaves ~55 min of margin
-      # for a slow day at GoFan. Unrelated to JOB_MAX_RUNTIME_SECONDS above -- neither
-      # bounds the other, so this does NOT need to be folded into that timeout ladder.
+      # There is NO total-runtime cap on a middle-school job, by design. Runtime scales
+      # linearly with the uploaded row count (~106 ms/row = ~2 min per 1,000 rows), so any
+      # fixed ceiling is really a row-count ceiling -- the previous 5400s value silently
+      # killed anything past ~44k rows. Liveness is judged instead by the worker's
+      # progress heartbeat: a job is failed only once that stops advancing for this long.
+      # Must comfortably exceed the slowest single item; the worker heartbeats every 25
+      # rows, so 15 min is very generous.
+      - key: MS_JOB_STALL_SECONDS
+        value: "900"
+      # Optional absolute backstop (s) for a job that heartbeats but never ends. 0 = off,
+      # which is the default and the recommended setting -- any finite value reintroduces
+      # the row-count ceiling described above.
       - key: MS_JOB_MAX_RUNTIME_SECONDS
-        value: "5400"
-      # Upload ceiling (bytes) for the CSV, default 200 MB. The real middle-school file is
-      # ~23 MB. The body is streamed to disk in 1 MB chunks, but the worker then holds the
-      # parsed rows in memory: measured 202 MB RSS for 16,655 rows x 126 columns. That
-      # sits comfortably beside two ~70 MB crawls on the 2 GB plan; raise this only
-      # alongside a memory check, since RSS scales with the row count.
+        value: "0"
+      # Upload ceiling (bytes) for the CSV, default 1 GB (~700k rows). The worker streams
+      # rows a chunk at a time, so peak RSS is ~50 MB regardless of file size -- memory no
+      # longer scales with the row count, and this is only a guard against a runaway
+      # upload filling the instance's disk.
       - key: MS_MAX_UPLOAD_BYTES
-        value: "209715200"
+        value: "1073741824"
