@@ -8,3 +8,6 @@ Twisted>=24.7,<25
 itemadapter>=0.8
 fastapi>=0.110
 uvicorn[standard]>=0.29
+# Required by FastAPI's UploadFile/Form -- the middle-school CSV upload (POST /ms/gofan)
+# returns HTTP 500 without it. FastAPI does not pull it in on its own.
+python-multipart>=0.0.9

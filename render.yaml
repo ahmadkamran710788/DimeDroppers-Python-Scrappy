@@ -43,3 +43,25 @@ services:
       # worker.py goes up.
       - key: JOB_MAX_RUNTIME_SECONDS
         value: "21600"
+      # --- GoFan middle-school flow (POST /ms/gofan) -------------------------------
+      # Independent of the MaxPreps knobs above: separate job registry, separate output
+      # dir (ms_jobs/), separate caps. Raising or lowering these cannot affect a crawl.
+      #
+      # Kept at 1. A run is ~35 min of steady outbound requests to api.gofan.co and the
+      # worker already saturates its own 8-way concurrency, so a second parallel job
+      # would double our request rate against GoFan for no throughput gain.
+      - key: MS_MAX_CONCURRENT_JOBS
+        value: "1"
+      # Wall-clock cap per middle-school job (s). A full 16,655-row file measured ~30 min
+      # of school lookups plus ~5 min of schedule fetches; 5400 leaves ~55 min of margin
+      # for a slow day at GoFan. Unrelated to JOB_MAX_RUNTIME_SECONDS above -- neither
+      # bounds the other, so this does NOT need to be folded into that timeout ladder.
+      - key: MS_JOB_MAX_RUNTIME_SECONDS
+        value: "5400"
+      # Upload ceiling (bytes) for the CSV, default 200 MB. The real middle-school file is
+      # ~23 MB. The body is streamed to disk in 1 MB chunks, but the worker then holds the
+      # parsed rows in memory: measured 202 MB RSS for 16,655 rows x 126 columns. That
+      # sits comfortably beside two ~70 MB crawls on the 2 GB plan; raise this only
+      # alongside a memory check, since RSS scales with the row count.
+      - key: MS_MAX_UPLOAD_BYTES
+        value: "209715200"

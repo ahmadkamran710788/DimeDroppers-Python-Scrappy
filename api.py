@@ -30,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from maxpreps_scraper.states import STATES
+from middle_school_api import router as middle_school_router
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -76,6 +77,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# GoFan middle-school flow (CSV upload -> school links + schedules). Entirely separate
+# from the MaxPreps endpoints below: its own job registry, output dir, concurrency cap
+# and runtime backstop all live in middle_school_api.py. See that module's docstring.
+app.include_router(middle_school_router)
 
 
 # --------------------------------------------------------------------------- #
