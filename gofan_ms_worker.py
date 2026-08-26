@@ -85,6 +85,9 @@ GOFAN_COLUMNS = [
     "gofan_state",
     "gofan_zip",
     "gofan_school_type",
+    # Unprefixed by request. Empty unless GoFan has a real logo for the school -- its
+    # generic wordmark is filtered out by gofan_client.logo_url.
+    "logo_url",
     "gofan_match",
     "gofan_match_score",
 ]
@@ -173,6 +176,8 @@ def _resolve(row):
         "gofan_state": candidate.get("state") or "",
         "gofan_zip": candidate.get("zipCode") or "",
         "gofan_school_type": candidate.get("industryCode") or "",
+        # Already in the search response we just made -- no extra request.
+        "logo_url": gofan_client.logo_url(candidate.get("logoUrl")),
         "gofan_match": kind,
         "gofan_match_score": score,
     }

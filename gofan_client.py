@@ -45,6 +45,12 @@ import urllib.request
 API = "https://api.gofan.co/v2"
 SCHOOL_URL = "https://gofan.co/app/school/{}"
 EVENT_URL = "https://gofan.co/event/{}"
+# Filename marker for GoFan's own wordmark, which the API serves as the logo for any
+# school that never uploaded one. Matched on the FILENAME, not the path: a handful of
+# real school logos live outside the usual /logo/<schoolId>/ prefix, so a path-shaped
+# test would wrongly discard them. Across the 25,300-school catalog this is the only
+# shared asset filename, and it covers 15,451 of them.
+PLACEHOLDER_LOGO = "gofan-logo"
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -90,6 +96,40 @@ def _get(url, tries=TRIES):
         # don't retry in lockstep and trip it again.
         time.sleep(min(8.0, 0.75 * (2**i)) + random.random() * 0.25)
     raise GofanError(f"giving up on {url}: {last}")
+
+
+def logo_url(raw):
+    """Return a usable logo URL for a school, or "" if GoFan has no real logo.
+
+    Two things have to happen to GoFan's ``logoUrl`` before it is fit to publish.
+
+    **It usually needs percent-encoding.** GoFan stores whatever filename the school
+    uploaded, so 4,418 of the 25,300 catalog URLs carry characters that are illegal in a
+    URL -- 8,954 spaces, plus parentheses, ``&``, commas, apostrophes, brackets, and 17
+    instances of U+202F (narrow no-break space, courtesy of macOS screenshot names).
+    Left raw they are not merely ugly, they are broken: curl returns 000 and Python
+    raises ``InvalidURL: URL can't contain control characters``. Encoded, they 200.
+
+    **The encoding has to treat everything after the host as one opaque path.**
+    ``urllib.parse.urlsplit`` would read the ``#`` in ``LOGO#1.png`` (three such URLs
+    exist) as a fragment delimiter and rebuild a URL that 404s. Splitting on ``://``
+    and quoting the remainder keeps those intact. ``%`` stays in the safe set so the
+    one already-encoded URL in the catalog isn't double-encoded, which also makes this
+    idempotent -- verified over 8,000 catalog URLs.
+
+    Returns "" for GoFan's generic wordmark (see PLACEHOLDER_LOGO) so a non-empty value
+    always means a genuine school logo.
+    """
+    url = (raw or "").strip()
+    if not url or PLACEHOLDER_LOGO in url.rsplit("/", 1)[-1]:
+        return ""
+    if "://" not in url:
+        return ""
+    scheme, rest = url.split("://", 1)
+    host, sep, path = rest.partition("/")
+    if not sep:
+        return url
+    return f"{scheme}://{host}/{urllib.parse.quote(path, safe='/%')}"
 
 
 def search_schools(name, limit=20):
