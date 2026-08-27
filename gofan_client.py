@@ -165,23 +165,29 @@ def _search_raw(q, limit=SEARCH_CAP):
 
 
 def _query_terms(name):
-    """(broad, narrow) query strings for a school name.
+    """(broad, fallback) query strings for a school name.
 
-    ``broad`` is the first distinctive word -- the shortest thing still likely to be a
-    substring of GoFan's own name for the school. ``narrow`` is the first two, used only
-    to escape a truncated result set.
+    ``broad`` is the school's **longest single distinctive word**, and being a single
+    word is the whole point. Because the endpoint matches a contiguous substring, any
+    multi-word query breaks the moment GoFan punctuates between those words -- "mt zion"
+    misses "Mt. Zion Middle School", "tri west" misses "Tri-West Middle School", and
+    "darnell cookman" misses "Darnell-Cookman Middle School". One word can never be
+    split that way.
+
+    Longest rather than first, because leading initials are worthless as a query:
+    "L. A. CHAFFIN MIDDLE SCHOOL" starts with "l", and a two-letter query like "l a"
+    matches hundreds of unrelated names and truncates before reaching Chaffin. Taking
+    the longest word gives "chaffin", which is both selective and safe.
+
+    ``fallback`` is the full original name, used only to top up a truncated result set.
     """
     words = [w for w in _PUNCT_TO_SPACE.sub(" ", (name or "").lower()).split() if w]
     distinctive = [w for w in words if w not in GENERIC_WORDS]
+    full = (name or "").strip()
     if not distinctive:
-        return (name or "").strip(), ""
-    broad = distinctive[0]
-    # A very short first word ("st", "mt", "e") is too weak on its own, so pull in the
-    # next one to keep the result set meaningful.
-    if len(broad) < 4 and len(distinctive) > 1:
-        broad = f"{distinctive[0]} {distinctive[1]}"
-    narrow = " ".join(distinctive[:2]) if len(distinctive) > 1 else (name or "").strip()
-    return broad, narrow
+        return full, ""
+    # max() keeps the first of equal-length words, so ties stay left-to-right.
+    return max(distinctive, key=len), full
 
 
 def search_schools(name, limit=SEARCH_CAP):
@@ -212,12 +218,18 @@ def search_schools(name, limit=SEARCH_CAP):
     first two words -- narrower, hence fewer results, hence not truncated. Measured cost
     across a real sample: 1.11 requests per row.
     """
-    broad, narrow = _query_terms(name)
+    broad, fallback = _query_terms(name)
     results = _search_raw(broad, limit)
-    if len(results) >= SEARCH_CAP and narrow and narrow != broad:
-        narrowed = _search_raw(narrow, limit)
-        if narrowed:
-            return narrowed
+    if len(results) >= SEARCH_CAP and fallback and fallback.lower() != broad:
+        # Truncated: a common word like "west" or "central" fills the 200-result cap and
+        # the school we want may be past it. Top up with the precise full-name query,
+        # which returns few or no rows. MERGE rather than replace -- the full name
+        # misses whenever GoFan spells the school differently, which is the very reason
+        # the broad query exists, so discarding the broad hits could lose the match.
+        merged = {c.get("huddleId"): c for c in results}
+        for c in _search_raw(fallback, limit):
+            merged.setdefault(c.get("huddleId"), c)
+        return list(merged.values())
     return results
 
 

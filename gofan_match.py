@@ -26,6 +26,7 @@ two-letter code. ``STATENAME`` is used only as a last-resort fallback via NAME_T
 """
 import difflib
 import re
+import unicodedata
 
 from maxpreps_scraper.states import STATES
 
@@ -63,6 +64,14 @@ NAME_FLOOR = 0.62
 # with NAME_FLOOR above. The second, laxer overlap needs a correspondingly higher
 # similarity -- see name_score for the labelled pair that pins OVERLAP_SIM_FLOOR at 0.72.
 OVERLAP_FLOOR = 0.6
+# How many extra words the longer name may add before a ONE-word overlap stops counting
+# as evidence. "Ruffner School" -> "Ruffner Middle School (MS)" adds one word and is the
+# same school; "Marin County Juvenile Court" -> "The Marin School" shares only "marin"
+# while three other words disagree, and is not. Two is the line between them.
+SUBSET_MAX_EXTRA = 2
+# Similarity at which a name counts as "the same name", letting it outrank the
+# middle-school type preference in pick(). Below this the type preference decides.
+EXACT_SIM = 0.95
 WEAK_OVERLAP_FLOOR = 0.5
 OVERLAP_SIM_FLOOR = 0.72
 
@@ -78,9 +87,21 @@ GENERIC_WORDS = frozenset({
 })
 
 
+def _fold(text):
+    """Lowercase and strip accents.
+
+    GoFan spells some schools with diacritics that NCES writes plain -- "Cesar Chavez
+    Academy" vs "Cesar Chavez Academy" with acutes. Without folding, the punctuation
+    regex shreds the accented form into "c sar ch vez", the two names share no words at
+    all, and a correct match is thrown away.
+    """
+    decomposed = unicodedata.normalize("NFKD", (text or ""))
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
+
+
 def normalize(name):
-    """Lowercase, strip punctuation and a generic trailing 'school'."""
-    s = (name or "").lower()
+    """Lowercase, fold accents, strip punctuation and a generic trailing 'school'."""
+    s = _fold(name)
     s = _PUNCT.sub(" ", s)
     s = s.strip()
     if s.startswith("the "):
@@ -133,7 +154,7 @@ def agrees(candidate, row):
 
 def _distinctive(name):
     """Set of a name's meaningful words, with generic school vocabulary removed."""
-    words = _PUNCT.sub(" ", (name or "").lower()).split()
+    words = _PUNCT.sub(" ", _fold(name)).split()
     return {w for w in words if w not in GENERIC_WORDS}
 
 
@@ -172,7 +193,9 @@ def name_score(row_name, candidate_name):
         return sim >= NAME_FLOOR, sim
     if R == C:
         return True, sim
-    if (R <= C or C <= R) and min(len(R), len(C)) >= 2:
+    if (R <= C or C <= R) and (
+        min(len(R), len(C)) >= 2 or abs(len(R) - len(C)) <= SUBSET_MAX_EXTRA
+    ):
         return True, sim
 
     overlap = len(R & C) / min(len(R), len(C))
@@ -205,12 +228,17 @@ def pick(candidates, row):
         ok, sim = name_score(target, c.get("name"))
         if not ok:
             continue  # gate 3: the names must actually resemble each other
-        scored.append((is_middle(c), sim, c))
+        scored.append((sim >= EXACT_SIM, is_middle(c), sim, c))
 
     if not scored:
         return None, "none", 0.0
 
-    # Middle-school records first, then closest name. One pass gives "prefer middle,
-    # fall back to any" without a second search.
-    is_mid, sim, best = max(scored, key=lambda t: (t[0], t[1]))
+    # Rank: an essentially-exact name first, then middle-school type, then closeness.
+    #
+    # The name has to outrank the type preference. Ordering by type first meant a
+    # weakly-named middle school beat a perfectly-named one of another type -- "J.
+    # Graham Brown School" was resolving to "Brown Middle School" purely because the
+    # latter is typed Middle School. Preferring middle schools is still right when the
+    # names are comparably good, which is what the second key does.
+    _exact, is_mid, sim, best = max(scored, key=lambda t: (t[0], t[1], t[2]))
     return best, ("middle" if is_mid else "city"), round(sim, 3)
