@@ -37,10 +37,16 @@ is why the schedule CSV this feeds doesn't have one.
 """
 import json
 import random
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# Shared name vocabulary. It lives in gofan_match because that module is about what a
+# school name *means*; this module only borrows it to decide what to type into the
+# search box. gofan_match imports nothing from here, so there is no cycle.
+from gofan_match import GENERIC_WORDS
 
 API = "https://api.gofan.co/v2"
 SCHOOL_URL = "https://gofan.co/app/school/{}"
@@ -51,6 +57,14 @@ EVENT_URL = "https://gofan.co/event/{}"
 # test would wrongly discard them. Across the 25,300-school catalog this is the only
 # shared asset filename, and it covers 15,451 of them.
 PLACEHOLDER_LOGO = "gofan-logo"
+
+# Hard server-side ceiling on /schools/search results. Asking for more returns no more
+# (limit=500 still yields 200), and `offset` does not paginate -- page 1 repeats page 0 --
+# so 200 is genuinely all we can see for one query. A result set AT this size must be
+# assumed truncated, which is what drives the narrower retry in search_schools.
+SEARCH_CAP = 200
+
+_PUNCT_TO_SPACE = re.compile(r"[^a-z0-9]+")
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -132,14 +146,9 @@ def logo_url(raw):
     return f"{scheme}://{host}/{urllib.parse.quote(path, safe='/%')}"
 
 
-def search_schools(name, limit=20):
-    """Return GoFan's search hits for a school name (possibly empty).
-
-    Each hit carries everything needed to verify a match without a second call:
-    ``{huddleId, name, city, state, zipCode, industryCode}``. That is the same
-    "City, ST" line the search UI shows under every result.
-    """
-    q = (name or "").strip()
+def _search_raw(q, limit=SEARCH_CAP):
+    """One raw call to the search endpoint. Returns [] on any failure."""
+    q = (q or "").strip()
     if not q:
         return []
     url = f"{API}/schools/search?" + urllib.parse.urlencode(
@@ -153,6 +162,63 @@ def search_schools(name, limit=20):
     if isinstance(data, dict):
         data = data.get("content") or []
     return [d for d in data if isinstance(d, dict)]
+
+
+def _query_terms(name):
+    """(broad, narrow) query strings for a school name.
+
+    ``broad`` is the first distinctive word -- the shortest thing still likely to be a
+    substring of GoFan's own name for the school. ``narrow`` is the first two, used only
+    to escape a truncated result set.
+    """
+    words = [w for w in _PUNCT_TO_SPACE.sub(" ", (name or "").lower()).split() if w]
+    distinctive = [w for w in words if w not in GENERIC_WORDS]
+    if not distinctive:
+        return (name or "").strip(), ""
+    broad = distinctive[0]
+    # A very short first word ("st", "mt", "e") is too weak on its own, so pull in the
+    # next one to keep the result set meaningful.
+    if len(broad) < 4 and len(distinctive) > 1:
+        broad = f"{distinctive[0]} {distinctive[1]}"
+    narrow = " ".join(distinctive[:2]) if len(distinctive) > 1 else (name or "").strip()
+    return broad, narrow
+
+
+def search_schools(name, limit=SEARCH_CAP):
+    """Return GoFan's search hits for a school name (possibly empty).
+
+    Each hit carries everything needed to verify a match without a second call:
+    ``{huddleId, name, city, state, zipCode, industryCode, logoUrl}``. That is the same
+    "City, ST" line the search UI shows under every result.
+
+    **The query is deliberately much shorter than the school's name.** This endpoint does
+    a *contiguous substring* match against GoFan's name -- ``q="ort Caroline"`` returns
+    Fort Caroline Middle School -- so every extra word NCES carries that GoFan does not
+    makes the whole query miss. Searching the full name returned nothing at all for a
+    large share of the file::
+
+        "DARNELL COOKMAN MIDDLE/HIGH SCHOOL"           -> 0   "DARNELL"              -> FL25620
+        "DUNCAN U. FLETCHER MIDDLE SCHOOL"             -> 0   "DUNCAN FLETCHER"      -> FL25623
+        "JAMES WELDON JOHNSON COLLEGE PREPARATORY ..." -> 0   "JAMES WELDON JOHNSON" -> FL25628
+        "MAYPORT COASTAL SCIENCE MIDDLE SCHOOL"        -> 0   "MAYPORT"              -> FL25636
+
+    Even a dropped middle initial breaks it ("ALFRED DUPONT" -> 0, "ALFRED I. DUPONT"
+    -> 1), so trimming to the first distinctive word is the only reliable query. The
+    broader result set costs nothing: ``gofan_match.pick`` still gates every candidate on
+    state, city/zip and name, and it does that locally.
+
+    ``limit`` caps server-side at 200 and ``offset`` does not paginate (page 1 repeats
+    page 0), so a broad query CAN silently truncate. When it does, retry once with the
+    first two words -- narrower, hence fewer results, hence not truncated. Measured cost
+    across a real sample: 1.11 requests per row.
+    """
+    broad, narrow = _query_terms(name)
+    results = _search_raw(broad, limit)
+    if len(results) >= SEARCH_CAP and narrow and narrow != broad:
+        narrowed = _search_raw(narrow, limit)
+        if narrowed:
+            return narrowed
+    return results
 
 
 def schools_by_ids(ids, batch=1000):

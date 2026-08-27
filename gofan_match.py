@@ -59,6 +59,23 @@ _MIDDLE = ("middle", "junior", "jr high", "intermediate")
 # That is the intended trade: a wrong ticket link is worse than a blank one, and
 # gofan_match/gofan_match_score keep every decision auditable.
 NAME_FLOOR = 0.62
+# Share of the smaller distinctive-word set that must be common to both names, paired
+# with NAME_FLOOR above. The second, laxer overlap needs a correspondingly higher
+# similarity -- see name_score for the labelled pair that pins OVERLAP_SIM_FLOOR at 0.72.
+OVERLAP_FLOOR = 0.6
+WEAK_OVERLAP_FLOOR = 0.5
+OVERLAP_SIM_FLOOR = 0.72
+
+# Words that carry no distinguishing information in a school name. Used for two things:
+# choosing the search query (gofan_client imports this) and measuring how much two names
+# genuinely have in common. Note this is a SUPERSET of what ``normalize`` strips --
+# normalize deliberately keeps "middle"/"junior" so a middle school is never conflated
+# with the same-named high school, whereas here they are noise.
+GENERIC_WORDS = frozenset({
+    "school", "schools", "middle", "high", "junior", "jr", "sr", "senior",
+    "elementary", "intermediate", "academy", "the", "of", "and", "at",
+    "campus", "center", "centre",
+})
 
 
 def normalize(name):
@@ -114,21 +131,56 @@ def agrees(candidate, row):
     return False
 
 
-def name_score(row_name, candidate_name):
-    """How strongly two school names agree: (passes_floor, similarity).
+def _distinctive(name):
+    """Set of a name's meaningful words, with generic school vocabulary removed."""
+    words = _PUNCT.sub(" ", (name or "").lower()).split()
+    return {w for w in words if w not in GENERIC_WORDS}
 
-    Token containment counts as agreement regardless of ratio, because a longer
-    catalog name that fully contains the row's words ("Gulf Shores Middle" vs "Gulf
-    Shores Middle School") is the same school with extra words -- and difflib's
-    whole-string ratio unfairly penalises that length gap. Otherwise the similarity
-    must clear NAME_FLOOR.
+
+def name_score(row_name, candidate_name):
+    """How strongly two school names agree: (passes, similarity).
+
+    Token containment counts as agreement regardless of ratio, because a longer catalog
+    name that fully contains the row's words ("Gulf Shores Middle" vs "Gulf Shores
+    Middle School") is the same school with extra words -- and difflib's whole-string
+    ratio unfairly penalises that length gap.
+
+    **Containment alone is not enough when the smaller side is a single word.** Since
+    the search query was widened to a single distinctive word, candidate pools are much
+    larger and a one-word overlap stopped being evidence: it let
+    "Marin County Juvenile Court" match "The Marin School" and "Duval Academy" match
+    "Florida Virtual Academy At Duval County", both in the right city and state. So a
+    subset only counts when the smaller set has at least two words; a lone word has to
+    carry the whole name (R == C, e.g. "Oceanway School" vs "Oceanway Middle School").
+
+    Everything else falls back to partial overlap plus string similarity, with a second,
+    stricter pairing for weaker overlap. Calibrated against hand-labelled borderline
+    pairs: this accepts "ALDEN ROAD EXCEP. STUDENT CENTER" -> "Alden Road Exceptional
+    Child Center" (overlap 0.50, sim 0.76) while still rejecting "Edinburgh Comm Middle
+    School" -> "Edinburgh Community High School" (overlap 0.50, sim 0.71). That pair is
+    why OVERLAP_SIM_FLOOR is 0.72 and not 0.70.
     """
     a, b = normalize(row_name), normalize(candidate_name)
     if not a or not b:
         return False, 0.0
     sim = difflib.SequenceMatcher(None, a, b).ratio()
-    ta, tb = set(a.split()), set(b.split())
-    return (ta <= tb or tb <= ta or sim >= NAME_FLOOR), sim
+
+    R, C = _distinctive(row_name), _distinctive(candidate_name)
+    if not R or not C:
+        # Nothing distinctive on one side (e.g. a name that is all generic words) --
+        # fall back to raw string similarity.
+        return sim >= NAME_FLOOR, sim
+    if R == C:
+        return True, sim
+    if (R <= C or C <= R) and min(len(R), len(C)) >= 2:
+        return True, sim
+
+    overlap = len(R & C) / min(len(R), len(C))
+    if overlap >= OVERLAP_FLOOR and sim >= NAME_FLOOR:
+        return True, sim
+    if overlap >= WEAK_OVERLAP_FLOOR and sim >= OVERLAP_SIM_FLOOR:
+        return True, sim
+    return False, sim
 
 
 def pick(candidates, row):

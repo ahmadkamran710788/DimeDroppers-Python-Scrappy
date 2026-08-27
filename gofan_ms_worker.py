@@ -39,6 +39,7 @@ import csv
 import datetime
 import json
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
@@ -91,6 +92,19 @@ GOFAN_COLUMNS = [
     "gofan_match",
     "gofan_match_score",
 ]
+
+# Colour columns. Unlike everything above, these already EXIST in the uploaded CSV (and
+# are entirely empty), so they are filled in place rather than appended -- the idempotent
+# column logic in link_schools only appends names that aren't already in the header.
+#
+# These are the one thing the search response cannot give us: colours come only from the
+# school detail record, so they are filled from a bulk lookup per chunk rather than
+# per row. Coverage is genuinely partial upstream -- across GoFan's catalog primaryColor
+# is present for 39% of schools and secondaryColor for 24% -- so a blank colour on a
+# matched row is correct, not a failure.
+COLOR_COLUMNS = ["SCHOOL_COLORS", "PRIMARY_SCHOOL_COLOR", "SECONDARY_SCHOOL_COLOR"]
+
+_HEX_COLOR = re.compile(r"^[0-9a-f]{6}$")
 
 # The GoFan analogue of maxpreps_scraper/export.py's GAME_FIELDS. The leading block
 # mirrors it so the two schedule CSVs read the same way. GoFan serves only upcoming,
@@ -183,6 +197,49 @@ def _resolve(row):
     }
 
 
+def _hex_color(raw):
+    """Normalise one GoFan colour to '#rrggbb', or '' if it isn't a usable colour.
+
+    GoFan stores bare 6-digit hex with inconsistent case ('9d0909', 'FF0000') and no
+    leading '#'. Anything that isn't exactly six hex digits (there is at least one
+    3-character value in the catalog) is dropped rather than guessed at.
+    """
+    v = str(raw or "").strip().lstrip("#").lower()
+    return f"#{v}" if _HEX_COLOR.match(v) else ""
+
+
+def _colors_for(detail):
+    """{column: value} colour fields for one GoFan detail record."""
+    primary = _hex_color((detail or {}).get("primaryColor"))
+    secondary = _hex_color((detail or {}).get("secondaryColor"))
+    return {
+        "SCHOOL_COLORS": ", ".join(c for c in (primary, secondary) if c),
+        "PRIMARY_SCHOOL_COLOR": primary,
+        "SECONDARY_SCHOOL_COLOR": secondary,
+    }
+
+
+def _fill_colors(chunk):
+    """Fill the colour columns for every matched row in a chunk, in one bulk request.
+
+    Batched per chunk rather than per row: ``schools_by_ids`` takes up to 1,000 ids at
+    a time, so a 500-row chunk costs exactly one extra POST no matter how many of its
+    rows matched.
+    """
+    ids = sorted({r["gofan_school_id"] for r in chunk if r.get("gofan_school_id")})
+    details = gofan_client.schools_by_ids(ids) if ids else {}
+    for row in chunk:
+        sid = row.get("gofan_school_id") or ""
+        # Only write where we actually have a school. An unmatched row keeps whatever
+        # the upload contained (empty, on the NCES file) rather than being blanked --
+        # this step must never destroy a value it didn't supply.
+        if sid and sid in details:
+            row.update(_colors_for(details[sid]))
+        else:
+            for col in COLOR_COLUMNS:
+                row.setdefault(col, "")
+
+
 def link_schools(job_dir, input_csv, limit):
     """Phase 1, streaming: add the gofan_* columns to the uploaded CSV.
 
@@ -203,8 +260,13 @@ def link_schools(job_dir, input_csv, limit):
         fieldnames = list(reader.fieldnames or [])
         if "SCH_NAME" not in fieldnames:
             raise SystemExit("uploaded CSV has no SCH_NAME column")
-        # Idempotent column addition, matching the idiom used across this repo.
-        out_fields = fieldnames + [c for c in GOFAN_COLUMNS if c not in fieldnames]
+        # Idempotent column addition, matching the idiom used across this repo. The
+        # colour columns are included so they still get a header on the rare upload that
+        # lacks them; on the normal NCES file they are already present and this is a
+        # no-op, leaving them to be filled in place.
+        out_fields = fieldnames + [
+            c for c in (GOFAN_COLUMNS + COLOR_COLUMNS) if c not in fieldnames
+        ]
 
         rows = islice(reader, limit) if limit else reader
 
@@ -240,6 +302,9 @@ def link_schools(job_dir, input_csv, limit):
                                 job_dir, phase="link", done=done, total=total,
                                 matched=matched, events=0,
                             )
+                    # One bulk detail call for the whole chunk, just before it is
+                    # written -- colours are the only field the search response omits.
+                    _fill_colors(chunk)
                     writer.writerows(chunk)
                     fout.flush()
                     _write_progress(
