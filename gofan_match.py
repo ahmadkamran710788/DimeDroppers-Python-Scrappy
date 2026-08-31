@@ -75,6 +75,17 @@ EXACT_SIM = 0.95
 WEAK_OVERLAP_FLOOR = 0.5
 OVERLAP_SIM_FLOOR = 0.72
 
+# "Boaz Pirates vs Albertville Middle" -- the delimiter GoFan event titles put between
+# the two teams. Case-insensitive, optional dot, must be a standalone word ("vs" inside
+# a school name like "Vestavia" can't match because of the surrounding whitespace).
+_VS_SPLIT = re.compile(r"\s+vs\.?\s+", re.IGNORECASE)
+# Separators between multiple opponents on ONE side of a title ("Albertville Middle &
+# Scottsboro Middle", "Caver MS/Putnam"). " and " is deliberately not one -- it appears
+# inside real school names ("Lewis and Clark").
+_OPP_SEP = re.compile(r"\s*[&/]\s*")
+# Title fragments that mean "no opponent named yet", never a school.
+_NON_OPPONENT = frozenset({"tbd", "tba", "tbc", "multi", "multiple", "opponent"})
+
 # Words that carry no distinguishing information in a school name. Used for two things:
 # choosing the search query (gofan_client imports this) and measuring how much two names
 # genuinely have in common. Note this is a SUPERSET of what ``normalize`` strips --
@@ -242,3 +253,114 @@ def pick(candidates, row):
     # names are comparably good, which is what the second key does.
     _exact, is_mid, sim, best = max(scored, key=lambda t: (t[0], t[1], t[2]))
     return best, ("middle" if is_mid else "city"), round(sim, 3)
+
+
+def parse_opponent(title, own_names):
+    """Read the opponent's name out of an event title, or "" if there isn't one.
+
+    Only consulted when the event carries no opponent id, which in practice means an
+    event *we* host -- away events always name their host. Handles the shapes found in
+    the real blank-opponent rows: "Gulf Shores Dolphins vs WS Neal" (our side carries
+    our mascot, not our name), "AthensGoldenEagles vs TBD" (our name concatenated into
+    one word, opponent not yet decided), "Smith Middle vs Caver MS/Putnam" (two
+    opponents; the first is taken, consistent with the single-value opponent column).
+
+    ``own_names`` is every string known to identify us -- GoFan name, uploaded
+    SCH_NAME, mascot. The side sharing tokens with any of them is ours; the other side
+    is the opponent. When neither side is recognisably us, the LEFT side is treated as
+    ours, because the host writes the title and lists itself first.
+    """
+    sides = [s.strip() for s in _VS_SPLIT.split(title or "") if s.strip()]
+    if len(sides) < 2:
+        return ""
+
+    own_tokens = set()
+    for n in own_names or ():
+        own_tokens |= _distinctive(n)
+
+    def us_score(side):
+        # Token equality, plus substring containment for concatenated forms:
+        # "athens" is not a token of "AthensGoldenEagles" but is a substring of it.
+        # Substrings shorter than 4 chars match too promiscuously to count.
+        toks = _distinctive(side)
+        squashed = re.sub(r"[^a-z0-9]", "", _fold(side))
+        return sum(
+            1 for t in own_tokens if t in toks or (len(t) >= 4 and t in squashed)
+        )
+
+    scores = [us_score(s) for s in sides]
+    us = max(range(len(sides)), key=lambda i: (scores[i], -i))
+    for i, side in enumerate(sides):
+        if i == us:
+            continue
+        for chunk in _OPP_SEP.split(side):
+            c = chunk.strip(" -–—")
+            if c and _fold(c).strip() not in _NON_OPPONENT:
+                return c
+    return ""
+
+
+def pick_opponent(candidates, name, state, precise=True):
+    """Resolve a title-parsed opponent name to one GoFan search hit, or None.
+
+    This mirrors the manual flow for opponents: type what the title says into the
+    search box; a single hit is taken as-is; several hits are narrowed to the row's
+    state; whatever is left must actually carry the parsed name -- where "carry" also
+    covers name+mascot, since the search matches mascots and a title like "Boaz
+    Pirates" agrees with name "Boaz High School" + mascot "Pirates".
+
+    The state gate applies even to a lone hit: "St. Clair County" (an Alabama
+    opponent) returns exactly one hit -- St. Clair County Community College, in
+    Michigan -- and a person reading "Port Huron, MI" under the result would not click
+    it. A lone hit is only auto-accepted once it is in the right state.
+
+    ``precise=False`` marks hits from the broad longest-word fallback query. Those are
+    a superset by construction, so they never get the lone-hit shortcut and must pass
+    the name gate like any other. Ambiguity returns None: a wrong school link is worse
+    than a blank one, same principle as pick().
+    """
+    cands = [c for c in candidates if isinstance(c, dict)]
+    st = (state or "").strip().upper()
+    if st:
+        cands = [c for c in cands if (c.get("state") or "").strip().upper() == st]
+    if not cands:
+        return None
+    if precise and len(cands) == 1:
+        return cands[0]
+
+    # Rank survivors by how well their DISTINCTIVE tokens carry the parsed name, then
+    # by school type, then raw similarity. Distinctive tokens first because a parsed
+    # opponent like "Homewood" ties "Homewood High School" against "Homewood Middle
+    # School" -- the raw ratio breaks that tie on nothing but name length, whereas
+    # token similarity ties them honestly and lets the type key decide. The type key:
+    # when the title states a type ("Homewood High School", "Foley Middle School"),
+    # believe it; when it is silent ("Homewood"), prefer the middle school, because
+    # every event reaching this resolver is a middle school's game.
+    words = set(_PUNCT.sub(" ", _fold(name)).split())
+    wants_middle = bool(words & {"middle", "junior", "jr", "intermediate"})
+    wants_high = "high" in words and not wants_middle
+
+    best = None
+    r_toks = " ".join(sorted(_distinctive(name)))
+    for c in cands:
+        variants = [c.get("name") or ""]
+        if c.get("mascot"):
+            variants.append(f"{variants[0]} {c['mascot']}")
+        ok, sim, tok_sim = False, 0.0, 0.0
+        for v in variants:
+            o, s = name_score(name, v)
+            ok, sim = ok or o, max(sim, s)
+            c_toks = " ".join(sorted(_distinctive(v)))
+            tok_sim = max(
+                tok_sim, difflib.SequenceMatcher(None, r_toks, c_toks).ratio()
+            )
+        if ok:
+            mid = is_middle(c)
+            if wants_middle or wants_high:
+                pref = (wants_middle and mid) or (wants_high and not mid)
+            else:
+                pref = mid
+            key = (round(tok_sim, 3), pref, sim)
+            if best is None or key > best[0]:
+                best = (key, c)
+    return best[1] if best else None

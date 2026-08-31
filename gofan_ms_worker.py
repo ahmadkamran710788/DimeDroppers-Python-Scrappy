@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 
 import gofan_client
-from gofan_match import pick
+from gofan_match import parse_opponent, pick, pick_opponent
 
 try:  # stdlib on 3.9+, but tzdata can be missing on a slim container
     from zoneinfo import ZoneInfo
@@ -115,7 +115,14 @@ GAME_FIELDS = [
     "gofan_school_id", "gofan_school_name", "gofan_url",
     "sport", "is_athletic", "gender", "level", "event_index",
     "date", "time", "start_datetime_utc", "timezone",
-    "home_away", "opponent", "event_title",
+    "home_away", "opponent",
+    # Who the opponent actually is on GoFan -- their page-header name, page URL and
+    # logo. Resolved from the event's opponent id when it has one (~90% of rows, free);
+    # otherwise by putting the title-parsed name through the search box, the way a
+    # person would. opponent_match records which ("id" / "search" / "" = unresolved).
+    "opponent_gofan_school_id", "opponent_gofan_name", "opponent_gofan_url",
+    "opponent_logo_url", "opponent_match",
+    "event_title",
     "venue_name", "venue_address", "venue_city", "venue_state", "venue_zip",
     "event_id", "event_url", "min_price", "is_postseason", "canceled",
 ]
@@ -377,22 +384,86 @@ def _min_price(event):
     return f"{min(prices):.2f}" if prices else ""
 
 
-def _event_row(school, event, index, names):
+_BLANK_OPPONENT = {
+    "opponent_gofan_school_id": "",
+    "opponent_gofan_name": "",
+    "opponent_gofan_url": "",
+    "opponent_logo_url": "",
+    "opponent_match": "",
+}
+
+
+def _opponent(school, event, home, host_id, names, resolve):
+    """Identify the event's opponent: ``(opponent_* columns, display_name)``.
+
+    Two paths, tried in order:
+
+    **By id** -- authoritative and free. A home event names its opponent in
+    ``opponentSchoolId``; an away event's opponent is the host, ``schoolHuddleId``.
+    Either way the detail record is already in ``names`` (phase 2 bulk-fetches every id
+    it sees), carrying the official name and logo. If the bulk lookup didn't know the
+    id, the id and URL are still written -- the URL needs nothing but the id -- with an
+    away row's name covered by ``financialSchoolName`` (that field names the HOST, so
+    on a home row it would name us, never the opponent).
+
+    **By search** -- the manual flow, for the ~10% of home events with no opponent id
+    (tri-matches, "X vs Y" titles). Parse the opponent off the title and put it through
+    the search box; ``resolve`` caches per (name, state) so a repeated opponent costs
+    one request. Non-athletic items (season passes, theatre dues) are skipped -- they
+    have no opponent to find. An unresolvable but parseable name is still returned as
+    the display name, so the ``opponent`` column beats a blank even when the link
+    couldn't be pinned down.
+    """
+    sid = school["gofan_school_id"]
+    opp_id = (event.get("opponentSchoolId") or "") if home else host_id
+    if opp_id:
+        detail = names.get(opp_id) or {}
+        name = detail.get("name") or (
+            "" if home else (event.get("financialSchoolName") or "")
+        )
+        return {
+            "opponent_gofan_school_id": opp_id,
+            "opponent_gofan_name": name,
+            "opponent_gofan_url": gofan_client.SCHOOL_URL.format(opp_id),
+            "opponent_logo_url": gofan_client.logo_url(detail.get("logoUrl")),
+            "opponent_match": "id",
+        }, name
+
+    if not (event.get("activity") or {}).get("isAthletic"):
+        return dict(_BLANK_OPPONENT), ""
+    own = (
+        school["gofan_name"],
+        school["sch_name"],
+        (names.get(sid) or {}).get("mascot") or "",
+    )
+    parsed = parse_opponent(event.get("title") or event.get("shortenName") or "", own)
+    if not parsed:
+        return dict(_BLANK_OPPONENT), ""
+    cand = resolve(parsed, school["state"])
+    if not cand:
+        return dict(_BLANK_OPPONENT), parsed
+    cid = cand.get("huddleId") or ""
+    return {
+        "opponent_gofan_school_id": cid,
+        "opponent_gofan_name": cand.get("name") or "",
+        "opponent_gofan_url": gofan_client.SCHOOL_URL.format(cid) if cid else "",
+        "opponent_logo_url": gofan_client.logo_url(cand.get("logoUrl")),
+        "opponent_match": "search",
+    }, cand.get("name") or parsed
+
+
+def _event_row(school, event, index, names, resolve):
     """Flatten one GoFan event into a schedule row for ``school``."""
     sid = school["gofan_school_id"]
     host_id = event.get("schoolHuddleId") or ""
     home = host_id == sid
-    # Away: the host school is the opponent, and its name is already on the event.
-    # Home: we are the host, so the opponent is opponentSchoolId, resolved in bulk.
+    opp_cols, opp_name = _opponent(school, event, home, host_id, names, resolve)
+    # The away preference order (financialSchoolName first) predates the opponent_*
+    # columns and is kept verbatim so existing opponent values don't shift.
     if home:
-        opp_id = event.get("opponentSchoolId") or ""
-        opponent = (names.get(opp_id) or {}).get("name") or ""
+        opponent = opp_name
     else:
-        opponent = (
-            event.get("financialSchoolName")
-            or (names.get(host_id) or {}).get("name")
-            or ""
-        )
+        opponent = event.get("financialSchoolName") or opp_name or ""
 
     date, time_, raw, tz = _local_parts(event)
     level, gender = _levels(event)
@@ -423,6 +494,7 @@ def _event_row(school, event, index, names):
         "timezone": tz,
         "home_away": "Home" if home else "Away",
         "opponent": opponent,
+        **opp_cols,
         "event_title": event.get("title") or event.get("shortenName") or "",
         "venue_name": venue.get("name") or "",
         "venue_address": venue.get("streetAddress") or "",
@@ -450,6 +522,18 @@ def scrape_schedules(job_dir, work_list, total_rows, matched):
     # *distinct* schools seen, not events, and is only ever added to once per id.
     names = {}
     done = written = 0
+
+    # (parsed name, state) -> search hit or None, for the title-parse fallback. The
+    # same opponents recur across a league's schedule, so most lookups are cache hits;
+    # a None is cached too, so an unresolvable name is searched once, not per event.
+    opp_cache = {}
+
+    def resolve_opponent(parsed, state):
+        key = (parsed.lower(), (state or "").strip().upper())
+        if key not in opp_cache:
+            hits, precise = gofan_client.search_opponent(parsed)
+            opp_cache[key] = pick_opponent(hits, parsed, state, precise=precise)
+        return opp_cache[key]
 
     with open(out_path, "w", newline="", encoding="utf-8") as fout:
         writer = csv.DictWriter(fout, fieldnames=GAME_FIELDS, extrasaction="ignore")
@@ -493,7 +577,7 @@ def scrape_schedules(job_dir, work_list, total_rows, matched):
                         sorted(events, key=lambda e: e.get("startDateTime") or ""),
                         start=1,
                     ):
-                        writer.writerow(_event_row(school, ev, i, names))
+                        writer.writerow(_event_row(school, ev, i, names, resolve_opponent))
                         written += 1
 
                 fout.flush()

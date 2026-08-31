@@ -233,6 +233,30 @@ def search_schools(name, limit=SEARCH_CAP):
     return results
 
 
+def search_opponent(name, limit=SEARCH_CAP):
+    """Search hits for a title-parsed opponent string: ``(hits, precise)``.
+
+    The raw string is tried first because this endpoint also matches a school's
+    MASCOT -- ``q="Boaz Pirates"`` returns exactly Boaz High School, and
+    ``q="Guntersville Wildcats"`` exactly Guntersville High School -- so the fragment
+    a person reads off an event title is usually the most precise query there is.
+    ``precise=True`` tells the caller the hits came from that raw query, which is what
+    justifies accepting a lone hit as-is (gofan_match.pick_opponent).
+
+    When the raw string finds nothing (GoFan punctuates differently: "WS Neal" -> 0
+    because GoFan spells it "W.S. Neal"), fall back to the same broad longest-word
+    machinery used for SCH_NAME. Those hits are a superset, so they are flagged
+    imprecise and must survive the state + name gates instead.
+    """
+    q = (name or "").strip()
+    if not q:
+        return [], False
+    hits = _search_raw(q, limit)
+    if hits:
+        return hits, True
+    return search_schools(q, limit), False
+
+
 def schools_by_ids(ids, batch=1000):
     """Resolve GoFan school ids to their detail records, in bulk.
 
