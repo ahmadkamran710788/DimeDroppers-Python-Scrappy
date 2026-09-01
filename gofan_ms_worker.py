@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 
 import gofan_client
-from gofan_match import parse_opponent, pick, pick_opponent
+from gofan_match import is_high, parse_opponent, pick, pick_opponent
 
 try:  # stdlib on 3.9+, but tzdata can be missing on a slim container
     from zoneinfo import ZoneInfo
@@ -182,9 +182,31 @@ def count_rows(path, limit=0):
 # --------------------------------------------------------------------------- #
 # Phase 1 -- resolve each row to a GoFan school
 # --------------------------------------------------------------------------- #
+# The upload's own level flags. When BOTH are explicitly false the row is neither an
+# elementary nor a middle school (JJAEP programs, alternative-ed centers) and GoFan is
+# not consulted for it at all.
+FLAG_COLUMNS = ("ELEMENTARY_FLAG", "MIDDLE_FLAG")
+_FALSE_FLAGS = {"false", "f", "0", "no", "n"}
+
+
+def _flags_exclude(row):
+    """True when the upload explicitly marks this row neither elementary nor middle.
+
+    Only two EXPLICIT false values skip the row. A blank cell or an absent column is
+    not a FALSE -- 643 rows of the real file carry blank flags and a third of them are
+    genuine, matchable middle schools -- and an upload without the columns at all is
+    processed in full.
+    """
+    vals = [(row.get(c) or "").strip().lower() for c in FLAG_COLUMNS if c in row]
+    return len(vals) == 2 and all(v in _FALSE_FLAGS for v in vals)
+
+
 def _resolve(row):
     """Search GoFan for one row and return the gofan_* values to write."""
     blank = {c: "" for c in GOFAN_COLUMNS}
+    if _flags_exclude(row):
+        blank["gofan_match"] = "skipped"
+        return blank
     blank["gofan_match"] = "none"
     name = (row.get("SCH_NAME") or "").strip()
     if not name:
@@ -680,6 +702,12 @@ def expand_opponents(job_dir, opponents, matched_ids, names):
             name = (detail.get("name") or opponents.get(sid) or "").strip()
             if not name:
                 continue  # nothing usable to write, not even a name
+            # High schools are excluded from the expansion by policy: they keep their
+            # name/logo on the event rows that mention them, but get no school row and
+            # no schedule of their own. Checked on the detail record when we have one,
+            # else on the name alone ("... High School" in the header).
+            if is_high(detail if detail else {"name": name}):
+                continue
             city = detail.get("city") or ""
             state = detail.get("state") or ""
             row = {c: "" for c in header}

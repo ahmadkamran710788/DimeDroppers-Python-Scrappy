@@ -13,11 +13,12 @@ So a candidate must clear three gates:
   2. **city / zip** -- ``agrees()``. A candidate in the right state but the wrong city
      is rejected; we never write a link for a same-named school two states' worth of
      highway away.
-  3. **school type** -- preference, not a gate. GoFan's ``industryCode`` tells us
-     whether a record is a middle school, and a real middle-school record is always
-     preferred. But a middle school's ticketing often lives on the district's or the
-     high school's GoFan page, so when no middle-school record agrees we fall back to
-     any agreeing record rather than losing the row. ``match_type`` records which
+  3. **school type** -- one hard exclusion plus a preference. A HIGH-SCHOOL record is
+     never a valid match (``is_high``, user policy: "if high school then eliminate
+     it"), so a row whose only candidates are high schools stays unmatched. Among
+     what remains, a real middle-school record is always preferred, but other types
+     (intermediate, academy, district) may still match -- GoFan's typing is too
+     unreliable to demand "Middle School" outright. ``match_type`` records what
      happened, so the CSV stays auditable.
 
 Column note: match on ``MSTATE`` (or ``ST``), not ``STATENAME``. The CSV's
@@ -158,6 +159,22 @@ def name_type(name):
     return ""
 
 
+def is_high(candidate):
+    """True if this record is a high school and nothing else.
+
+    Middle-ness always wins: "Junior High School" is a middle school, and a combined
+    "Middle/High" record serves the middle school too. Past that, believe either
+    GoFan's industryCode or the record's NAME -- real high schools sit under
+    ``industryCode: "Member School"`` with "... Senior High School" only in the header
+    name, and industryCode is already known to lie for intermediates. Works on detail
+    records, search hits, and name-only dicts alike.
+    """
+    if is_middle(candidate) or name_type(candidate.get("name")) == "middle":
+        return False
+    code = str(candidate.get("industryCode") or "").lower()
+    return "high" in code or name_type(candidate.get("name")) == "high"
+
+
 def _prefer(candidate, row_type):
     """Whether pick() should prefer this candidate, given what the row's name states.
 
@@ -169,12 +186,10 @@ def _prefer(candidate, row_type):
     says middle, a candidate that says high is actively dispreferred rather than
     merely not preferred.
     """
-    cand_middle = is_middle(candidate) or name_type(candidate.get("name")) == "middle"
     if row_type == "high":
-        code = str(candidate.get("industryCode") or "").lower()
-        return not cand_middle and ("high" in code or name_type(candidate.get("name")) == "high")
+        return is_high(candidate)
     # row says middle, or says nothing: a middle-school record is the one we want.
-    return cand_middle
+    return is_middle(candidate) or name_type(candidate.get("name")) == "middle"
 
 
 def agrees(candidate, row):
@@ -281,6 +296,8 @@ def pick(candidates, row):
     R = _distinctive(target)
     scored = []
     for c in candidates:
+        if is_high(c):
+            continue  # gate 0: a high-school page is never a valid match, by policy
         if (c.get("state") or "").strip().upper() != st:
             continue  # gate 1: state, structural -- never cross state lines
         if not agrees(c, row):
