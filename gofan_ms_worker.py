@@ -14,12 +14,16 @@ Usage (invoked by middle_school_api.py, not by hand):
     input_csv  the CSV the user uploaded; must have a SCH_NAME column
     limit      optional max rows to process ("0"/absent = every row)
 
-Two phases, two outputs:
+Three phases, two outputs:
 
   Phase 1 -> gofan_schools.csv    every column of the uploaded CSV, unchanged, plus
-                                  nine gofan_* columns naming the matched school.
+                                  the gofan_* columns naming the matched school.
   Phase 2 -> gofan_schedule.csv   one row per upcoming GoFan event, for every school
-                                  phase 1 matched.
+                                  phase 1 matched, each naming its opponent.
+  Phase 3 -> both, appended       every opponent those schedules revealed becomes a
+                                  row of gofan_schools.csv (GoFan name in SCH_NAME,
+                                  gofan_match="opponent"), and its own schedule is
+                                  appended to gofan_schedule.csv. No new columns.
 
 **Both phases stream.** Rows are read, enriched and written a chunk at a time, and
 nothing is ever accumulated across the whole file, so peak memory is set by CHUNK_ROWS
@@ -509,25 +513,57 @@ def _event_row(school, event, index, names, resolve):
     }
 
 
-def scrape_schedules(job_dir, work_list, total_rows, matched):
-    """Phase 2, streaming: one CSV row per upcoming event, for every matched school."""
+# The fields of a GoFan detail record this worker reads. The bulk endpoint returns far
+# more (theme, sales and integration settings), and ``names`` holds one record per
+# distinct school seen -- a space that roughly doubles once opponents are expanded --
+# so only these are kept.
+_DETAIL_FIELDS = (
+    "name", "city", "state", "zipCode", "industryCode", "logoUrl",
+    "primaryColor", "secondaryColor", "mascot",
+)
+
+
+def _fetch_details(ids, names):
+    """Add slimmed detail records to ``names`` for any of ``ids`` not already there."""
+    wanted = sorted(i for i in set(ids) if i and i not in names)
+    if not wanted:
+        return
+    for sid, rec in gofan_client.schools_by_ids(wanted).items():
+        names[sid] = {k: rec.get(k) for k in _DETAIL_FIELDS}
+
+
+def scrape_schedules(
+    job_dir, work_list, total_rows, matched, *, names, opp_cache,
+    phase="schedule", append=False, events_so_far=0,
+):
+    """Streaming: one CSV row per upcoming event, for every school in ``work_list``.
+
+    Runs twice per job. The first pass (``phase="schedule"``) covers the schools phase
+    1 matched and writes the file from scratch. The second (``phase="opponents"``,
+    ``append=True``) covers the opponents those schedules revealed and appends to the
+    same file under the same columns. ``names`` and ``opp_cache`` are shared across the
+    two passes so nothing already resolved is fetched or searched again.
+
+    Returns ``(opponents, events_total)``: every opponent id written this pass mapped
+    to the best name seen for it, and the cumulative event count including
+    ``events_so_far``. The first pass's opponents drive the expansion; the second
+    pass's are discarded -- that is where the recursion stops. Its rows still carry
+    full opponent_* enrichment, which is exactly the "opponents' opponents get name
+    and logo" requirement.
+    """
     total = len(work_list)
     out_path = os.path.join(job_dir, SCHEDULE_CSV)
+    written = events_so_far
+    done = 0
+    opponents = {}
     _write_progress(
-        job_dir, phase="schedule", done=0, total=total,
-        matched=matched, events=0, rows=total_rows,
+        job_dir, phase=phase, done=0, total=total,
+        matched=matched, events=written, rows=total_rows,
     )
 
-    # id -> detail, for naming opponents on home games. Grows with the number of
-    # *distinct* schools seen, not events, and is only ever added to once per id.
-    names = {}
-    done = written = 0
-
-    # (parsed name, state) -> search hit or None, for the title-parse fallback. The
-    # same opponents recur across a league's schedule, so most lookups are cache hits;
-    # a None is cached too, so an unresolvable name is searched once, not per event.
-    opp_cache = {}
-
+    # opp_cache: (parsed name, state) -> search hit or None, for the title-parse
+    # fallback. The same opponents recur across a league's schedule, so most lookups
+    # are cache hits; a None is cached too, so an unresolvable name is searched once.
     def resolve_opponent(parsed, state):
         key = (parsed.lower(), (state or "").strip().upper())
         if key not in opp_cache:
@@ -535,9 +571,10 @@ def scrape_schedules(job_dir, work_list, total_rows, matched):
             opp_cache[key] = pick_opponent(hits, parsed, state, precise=precise)
         return opp_cache[key]
 
-    with open(out_path, "w", newline="", encoding="utf-8") as fout:
+    with open(out_path, "a" if append else "w", newline="", encoding="utf-8") as fout:
         writer = csv.DictWriter(fout, fieldnames=GAME_FIELDS, extrasaction="ignore")
-        writer.writeheader()
+        if not append:
+            writer.writeheader()
 
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             for batch in _chunks(work_list, CHUNK_SCHOOLS):
@@ -555,39 +592,128 @@ def scrape_schedules(job_dir, work_list, total_rows, matched):
                         # Heartbeat during the fetch too -- a batch of 100 schools is
                         # minutes of network on its own.
                         _write_progress(
-                            job_dir, phase="schedule", done=done, total=total,
+                            job_dir, phase=phase, done=done, total=total,
                             matched=matched, events=written, rows=total_rows,
                         )
 
-                # Resolve this batch's unseen opponent ids in one POST, then write and
+                # Resolve this batch's unseen school ids in one POST, then write and
                 # drop the events. Batching per chunk (rather than once globally at the
                 # end) is what keeps events from piling up in memory.
-                wanted = {
-                    ev[key]
-                    for _, events in fetched
-                    for ev in events
-                    for key in ("schoolHuddleId", "opponentSchoolId")
-                    if ev.get(key) and ev[key] not in names
-                }
-                if wanted:
-                    names.update(gofan_client.schools_by_ids(sorted(wanted)))
+                _fetch_details(
+                    (
+                        ev[key]
+                        for _, events in fetched
+                        for ev in events
+                        for key in ("schoolHuddleId", "opponentSchoolId")
+                        if ev.get(key)
+                    ),
+                    names,
+                )
 
                 for school, events in fetched:
                     for i, ev in enumerate(
                         sorted(events, key=lambda e: e.get("startDateTime") or ""),
                         start=1,
                     ):
-                        writer.writerow(_event_row(school, ev, i, names, resolve_opponent))
+                        row = _event_row(school, ev, i, names, resolve_opponent)
+                        writer.writerow(row)
                         written += 1
+                        oid = row["opponent_gofan_school_id"]
+                        if oid:
+                            # Keep a name even when the bulk lookup had no record for
+                            # this id -- an away row still names its host -- so the
+                            # expansion can give the school a row regardless.
+                            opponents[oid] = opponents.get(oid) or row["opponent_gofan_name"]
 
                 fout.flush()
                 _write_progress(
-                    job_dir, phase="schedule", done=done, total=total,
+                    job_dir, phase=phase, done=done, total=total,
                     matched=matched, events=written, rows=total_rows,
                 )
 
-    print(f"phase 2: {total} schools | {written} events | -> {out_path}", flush=True)
-    return written
+    print(
+        f"phase {phase}: {total} schools | {written - events_so_far} events"
+        f" | -> {out_path}",
+        flush=True,
+    )
+    return opponents, written
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 -- promote the opponents to schools of their own
+# --------------------------------------------------------------------------- #
+def expand_opponents(job_dir, opponents, matched_ids, names):
+    """Append every newly-discovered opponent to gofan_schools.csv; return a work list.
+
+    ``opponents`` maps opponent id -> name as seen on the events. An opponent that is
+    itself one of the uploaded, matched schools is skipped -- it already has a row, and
+    its schedule was already fetched. Everything else gets one row under the file's
+    EXISTING header (re-read from the file rather than recomputed, so it cannot
+    drift): the GoFan name in SCH_NAME, GoFan city/state/zip in the mailing-address
+    columns so the preview isn't blank, and the gofan_* / logo / colour columns filled
+    from the detail record. ``gofan_match`` is "opponent", keeping the provenance
+    auditable without a new column; the score stays blank because this is an id walk,
+    not a fuzzy match.
+
+    A few ids are unknown to the bulk endpoint (GoFan still lists events under them).
+    Those keep the name the events gave them and get a row with just name, id and
+    link -- their schedule is fetched by id like any other.
+
+    Returns the work list in exactly the shape link_schools produces, so
+    scrape_schedules consumes it unchanged for the appended schedules.
+    """
+    new_ids = sorted(i for i in opponents if i and i not in matched_ids)
+    _write_progress(job_dir, phase="opponents", done=0, total=len(new_ids))
+    # Search-resolved opponents arrived as search hits, which carry no colours; one
+    # bulk sweep gives every new id the same full record.
+    _fetch_details(new_ids, names)
+
+    schools_path = os.path.join(job_dir, SCHOOLS_CSV)
+    with open(schools_path, newline="", encoding="utf-8") as fh:
+        header = next(csv.reader(fh), [])
+
+    work_list = []
+    with open(schools_path, "a", newline="", encoding="utf-8") as fout:
+        writer = csv.DictWriter(fout, fieldnames=header, extrasaction="ignore")
+        for sid in new_ids:
+            detail = names.get(sid) or {}
+            name = (detail.get("name") or opponents.get(sid) or "").strip()
+            if not name:
+                continue  # nothing usable to write, not even a name
+            city = detail.get("city") or ""
+            state = detail.get("state") or ""
+            row = {c: "" for c in header}
+            row.update({
+                "SCH_NAME": name,
+                "MCITY": city,
+                "MSTATE": state,
+                "MZIP": detail.get("zipCode") or "",
+                "gofan_url": gofan_client.SCHOOL_URL.format(sid),
+                "gofan_school_id": sid,
+                "gofan_name": name,
+                "gofan_city": city,
+                "gofan_state": state,
+                "gofan_zip": detail.get("zipCode") or "",
+                "gofan_school_type": detail.get("industryCode") or "",
+                "logo_url": gofan_client.logo_url(detail.get("logoUrl")),
+                "gofan_match": "opponent",
+                "gofan_match_score": "",
+            })
+            row.update(_colors_for(detail))
+            writer.writerow(row)
+            work_list.append({
+                "gofan_school_id": sid,
+                "gofan_name": name,
+                "sch_name": name,
+                "nces_school_id": "",
+                "state": state,
+                "city": city,
+            })
+
+    print(
+        f"phase 3: {len(work_list)} opponents appended to {schools_path}", flush=True
+    )
+    return work_list
 
 
 # --------------------------------------------------------------------------- #
@@ -602,8 +728,20 @@ def main():
     limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
     os.makedirs(job_dir, exist_ok=True)
 
+    # Shared across both schedule passes: id -> slimmed detail record, and the
+    # opponent-search cache. Each grows with distinct schools seen, never with events.
+    names, opp_cache = {}, {}
+
     total_rows, matched, work_list = link_schools(job_dir, input_csv, limit)
-    events = scrape_schedules(job_dir, work_list, total_rows, matched)
+    opponents, events = scrape_schedules(
+        job_dir, work_list, total_rows, matched, names=names, opp_cache=opp_cache,
+    )
+    matched_ids = {w["gofan_school_id"] for w in work_list}
+    expansion = expand_opponents(job_dir, opponents, matched_ids, names)
+    _, events = scrape_schedules(
+        job_dir, expansion, total_rows, matched, names=names, opp_cache=opp_cache,
+        phase="opponents", append=True, events_so_far=events,
+    )
 
     _write_progress(
         job_dir, phase="done", done=total_rows, total=total_rows,

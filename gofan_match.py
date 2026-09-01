@@ -138,6 +138,45 @@ def is_middle(candidate):
     return any(m in code for m in _MIDDLE)
 
 
+# Words in a school's NAME that state its level. "int" and the initialisms cover the
+# abbreviated NCES style ("CALDWELL INT", "FOO JR HIGH").
+_NAME_MIDDLE = frozenset({"middle", "junior", "jr", "intermediate", "int", "ms", "jh", "jhs"})
+_NAME_HIGH = frozenset({"high", "hs", "shs"})
+
+
+def name_type(name):
+    """"middle" / "high" / "" as stated by the name itself.
+
+    A name containing both ("JR HIGH", "MIDDLE/HIGH") counts as middle -- the middle
+    marker is the informative one in a middle-school file.
+    """
+    words = set(_PUNCT.sub(" ", _fold(name or "")).split())
+    if words & _NAME_MIDDLE:
+        return "middle"
+    if words & _NAME_HIGH:
+        return "high"
+    return ""
+
+
+def _prefer(candidate, row_type):
+    """Whether pick() should prefer this candidate, given what the row's name states.
+
+    GoFan's industryCode alone is not trustworthy here: real intermediate schools sit
+    under "Elementary School" or the meaningless "Member School", so for the row
+    "CALDWELL INT" the type preference never fired and raw similarity chose "Caldwell
+    High School" (0.80) over "Caldwell Intermediate School" (0.73). Reading the level
+    out of the candidate's NAME as well fixes that family. And when the row explicitly
+    says middle, a candidate that says high is actively dispreferred rather than
+    merely not preferred.
+    """
+    cand_middle = is_middle(candidate) or name_type(candidate.get("name")) == "middle"
+    if row_type == "high":
+        code = str(candidate.get("industryCode") or "").lower()
+        return not cand_middle and ("high" in code or name_type(candidate.get("name")) == "high")
+    # row says middle, or says nothing: a middle-school record is the one we want.
+    return cand_middle
+
+
 def agrees(candidate, row):
     """True if the candidate's city or zip corroborates the row.
 
@@ -196,6 +235,14 @@ def name_score(row_name, candidate_name):
     if not a or not b:
         return False, 0.0
     sim = difflib.SequenceMatcher(None, a, b).ratio()
+    if sim >= EXACT_SIM:
+        # An essentially-identical string is the same name no matter how it tokenises.
+        # Without this, "LaVergne Middle School" (sim 0.97 against GoFan's "La Vergne
+        # Middle School") was REJECTED: the space split makes the token sets disjoint,
+        # overlap is 0, and every token rule fails -- leaving the same-named high
+        # school as the only survivor. Same story for "Ke Ana Laahana" vs GoFan's
+        # "Ke Ana La Ahana".
+        return True, sim
 
     R, C = _distinctive(row_name), _distinctive(candidate_name)
     if not R or not C:
@@ -230,6 +277,8 @@ def pick(candidates, row):
     if not st or not normalize(target) or not candidates:
         return None, "none", 0.0
 
+    row_type = name_type(target)
+    R = _distinctive(target)
     scored = []
     for c in candidates:
         if (c.get("state") or "").strip().upper() != st:
@@ -239,20 +288,30 @@ def pick(candidates, row):
         ok, sim = name_score(target, c.get("name"))
         if not ok:
             continue  # gate 3: the names must actually resemble each other
-        scored.append((sim >= EXACT_SIM, is_middle(c), sim, c))
+        C = _distinctive(c.get("name"))
+        contained = bool(R and C and (R <= C or C <= R))
+        scored.append((sim >= EXACT_SIM, contained, _prefer(c, row_type), sim, c))
 
     if not scored:
         return None, "none", 0.0
 
-    # Rank: an essentially-exact name first, then middle-school type, then closeness.
+    # Rank: an essentially-exact name first, then token containment, then the type
+    # preference, then closeness.
     #
     # The name has to outrank the type preference. Ordering by type first meant a
     # weakly-named middle school beat a perfectly-named one of another type -- "J.
     # Graham Brown School" was resolving to "Brown Middle School" purely because the
-    # latter is typed Middle School. Preferring middle schools is still right when the
-    # names are comparably good, which is what the second key does.
-    _exact, is_mid, sim, best = max(scored, key=lambda t: (t[0], t[1], t[2]))
-    return best, ("middle" if is_mid else "city"), round(sim, 3)
+    # latter is typed Middle School. Preferring the right school type is still correct
+    # when the names are comparably good, which is what the later keys do.
+    #
+    # Containment sits second because one name wholly containing the other is stronger
+    # evidence than a partial overlap with a flattering character ratio: for "Barret
+    # Traditional Middle", raw similarity marginally preferred "Johnson Traditional
+    # Middle School" (0.745, sharing only "traditional") over "Barret Middle School"
+    # (0.70, wholly contained in the row's name). Containment breaks that the right way.
+    _exact, _cont, _pref, sim, best = max(scored, key=lambda t: (t[0], t[1], t[2], t[3]))
+    # The match label stays keyed to GoFan's own classification, not our preference.
+    return best, ("middle" if is_middle(best) else "city"), round(sim, 3)
 
 
 def parse_opponent(title, own_names):

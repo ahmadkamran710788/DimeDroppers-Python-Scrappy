@@ -165,29 +165,31 @@ def _search_raw(q, limit=SEARCH_CAP):
 
 
 def _query_terms(name):
-    """(broad, fallback) query strings for a school name.
+    """(distinctive words longest-first, full name) query material for a school name.
 
-    ``broad`` is the school's **longest single distinctive word**, and being a single
-    word is the whole point. Because the endpoint matches a contiguous substring, any
-    multi-word query breaks the moment GoFan punctuates between those words -- "mt zion"
-    misses "Mt. Zion Middle School", "tri west" misses "Tri-West Middle School", and
-    "darnell cookman" misses "Darnell-Cookman Middle School". One word can never be
-    split that way.
+    Every query is a **single word**, and that is the whole point. Because the
+    endpoint matches a contiguous substring, any multi-word query breaks the moment
+    GoFan punctuates between those words -- "mt zion" misses "Mt. Zion Middle School",
+    "tri west" misses "Tri-West Middle School", and "darnell cookman" misses
+    "Darnell-Cookman Middle School". One word can never be split that way.
 
-    Longest rather than first, because leading initials are worthless as a query:
-    "L. A. CHAFFIN MIDDLE SCHOOL" starts with "l", and a two-letter query like "l a"
-    matches hundreds of unrelated names and truncates before reaching Chaffin. Taking
-    the longest word gives "chaffin", which is both selective and safe.
+    Longest first, because leading initials are worthless as a query: "L. A. CHAFFIN
+    MIDDLE SCHOOL" starts with "l", and a two-letter query like "l a" matches hundreds
+    of unrelated names and truncates before reaching Chaffin. The longest word,
+    "chaffin", is both selective and safe. The remaining words matter only when the
+    first one truncates -- see search_schools.
 
-    ``fallback`` is the full original name, used only to top up a truncated result set.
+    The full original name is used only to top up a truncated result set.
     """
     words = [w for w in _PUNCT_TO_SPACE.sub(" ", (name or "").lower()).split() if w]
-    distinctive = [w for w in words if w not in GENERIC_WORDS]
-    full = (name or "").strip()
-    if not distinctive:
-        return full, ""
-    # max() keeps the first of equal-length words, so ties stay left-to-right.
-    return max(distinctive, key=len), full
+    # dict.fromkeys dedupes while keeping order; the stable sort then keeps
+    # equal-length words left-to-right, so words[0] is the leftmost longest word.
+    distinctive = sorted(
+        dict.fromkeys(w for w in words if w not in GENERIC_WORDS),
+        key=len,
+        reverse=True,
+    )
+    return distinctive, (name or "").strip()
 
 
 def search_schools(name, limit=SEARCH_CAP):
@@ -214,23 +216,28 @@ def search_schools(name, limit=SEARCH_CAP):
     state, city/zip and name, and it does that locally.
 
     ``limit`` caps server-side at 200 and ``offset`` does not paginate (page 1 repeats
-    page 0), so a broad query CAN silently truncate. When it does, retry once with the
-    first two words -- narrower, hence fewer results, hence not truncated. Measured cost
-    across a real sample: 1.11 requests per row.
+    page 0), so a broad query CAN silently truncate -- and which 200 schools fill the
+    window is not even stable between runs ("Bush Hills" matched in one run and not
+    the next, on identical code). When the first query truncates, every OTHER
+    distinctive word is queried too and the results merged: "JAMES WELDON JOHNSON
+    COLLEGE PREPARATORY" leads with "preparatory", which caps at 200 without the
+    school, but "weldon" returns 4 rows including it. The full original name joins
+    the sweep for schools whose every word is common. Merging keeps the arbitrary
+    first window too -- the school might be in it. Cost: only rows whose longest word
+    is common pay for the sweep.
     """
-    broad, fallback = _query_terms(name)
-    results = _search_raw(broad, limit)
-    if len(results) >= SEARCH_CAP and fallback and fallback.lower() != broad:
-        # Truncated: a common word like "west" or "central" fills the 200-result cap and
-        # the school we want may be past it. Top up with the precise full-name query,
-        # which returns few or no rows. MERGE rather than replace -- the full name
-        # misses whenever GoFan spells the school differently, which is the very reason
-        # the broad query exists, so discarding the broad hits could lose the match.
-        merged = {c.get("huddleId"): c for c in results}
-        for c in _search_raw(fallback, limit):
+    words, full = _query_terms(name)
+    if not words:
+        return _search_raw(full, limit)
+    results = _search_raw(words[0], limit)
+    if len(results) < SEARCH_CAP:
+        return results
+    merged = {c.get("huddleId"): c for c in results}
+    sweep = words[1:] + ([full] if full.lower() != words[0] else [])
+    for q in sweep:
+        for c in _search_raw(q, limit):
             merged.setdefault(c.get("huddleId"), c)
-        return list(merged.values())
-    return results
+    return list(merged.values())
 
 
 def search_opponent(name, limit=SEARCH_CAP):
