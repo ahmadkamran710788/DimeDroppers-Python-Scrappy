@@ -18,8 +18,13 @@ Three phases, two outputs:
 
   Phase 1 -> gofan_schools.csv    every column of the uploaded CSV, unchanged, plus
                                   the gofan_* columns naming the matched school.
-  Phase 2 -> gofan_schedule.csv   one row per upcoming GoFan event, for every school
-                                  phase 1 matched, each naming its opponent.
+  Phase 2 -> gofan_schedule.csv   one row per upcoming middle-school GAME, for every
+                                  school phase 1 matched, each naming its opponent.
+                                  A school's GoFan page also sells its district's
+                                  high-school tickets and non-game items, so two gates
+                                  apply -- see ``_keep_event``: the title must name an
+                                  opponent with "vs", and the level must be one of
+                                  MS_LEVELS.
   Phase 3 -> both, appended       every opponent those schedules revealed becomes a
                                   row of gofan_schools.csv (GoFan name in SCH_NAME,
                                   gofan_match="opponent"), and its own schedule is
@@ -49,7 +54,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 
 import gofan_client
-from gofan_match import is_high, parse_opponent, pick, pick_opponent
+from gofan_match import has_vs, is_high, parse_opponent, pick, pick_opponent
 
 try:  # stdlib on 3.9+, but tzdata can be missing on a slim container
     from zoneinfo import ZoneInfo
@@ -399,6 +404,43 @@ def _levels(event):
     return "; ".join(dict.fromkeys(names)), "; ".join(dict.fromkeys(genders))
 
 
+# The only levels a middle-school schedule should carry. A middle school's own GoFan
+# page also sells its district's high-school tickets -- Varsity, Junior Varsity,
+# Freshman, Froshmore, B Squad and a blank level are all present in real data -- and
+# phase 3 walks opponents whose schedules are mostly high school. Lowercased because the
+# comparison is; GoFan writes them Title Case.
+MS_LEVELS = frozenset({"middle school", "6th grade", "7th grade", "8th grade"})
+
+
+def _keep_event(event):
+    """True when this event is a real middle-school game against a named opponent.
+
+    Read off the RAW event, deliberately before ``_event_row`` builds anything: its
+    ``_opponent`` step falls back to a live GoFan search for any athletic event with no
+    opponent id, and multi-team titles -- tri-matches, invitationals -- are precisely the
+    events that lack one. Filtering first means a dropped row never costs a request.
+
+    **Title.** "vs" separates a head-to-head with one named opponent ("Mayport Middle vs
+    Twin Lakes Academy Middle") from a season pass, a tournament day or a tri-match
+    ("Twin Lakes Academy Middle Volleyball", "Berry Tri-Match: Hewitt-Trussville MS &
+    Oak Mountain MS"), none of which have a single opponent to put in the ``opponent``
+    column. The gate also removes every non-game item on its own -- across a 59,607-row
+    run, 100% of the survivors are ``is_athletic == "yes"`` -- so there is no separate
+    athletic gate to add.
+
+    **Level.** One GoFan event can carry several ("Varsity; Junior Varsity; Middle
+    School" is a real value). ONE middle-school level is enough to keep the row: the
+    ticket admits to a middle-school game, which is what this schedule is for.
+
+    Both strings are read exactly as ``_event_row`` writes them, so the filter and the
+    ``event_title`` / ``level`` columns can never disagree.
+    """
+    if not has_vs(event.get("title") or event.get("shortenName") or ""):
+        return False
+    level, _gender = _levels(event)
+    return any(part.strip().lower() in MS_LEVELS for part in level.split(";"))
+
+
 def _min_price(event):
     prices = [
         t.get("price")
@@ -508,8 +550,9 @@ def _event_row(school, event, index, names, resolve):
         or event.get("eventTypeName")
         or "",
         # A school's GoFan page also sells non-game items (season pass cards, theatre,
-        # registration). They are real rows on that page, so they are not dropped --
-        # this flag lets a consumer filter to games without losing anything.
+        # registration). ``_keep_event`` now drops those before a row is ever built --
+        # their titles name no opponent -- so in practice this is "yes" on every written
+        # row. The column stays for compatibility with existing consumers.
         "is_athletic": "yes" if (event.get("activity") or {}).get("isAthletic") else "no",
         "gender": gender,
         "level": level,
@@ -633,8 +676,18 @@ def scrape_schedules(
                 )
 
                 for school, events in fetched:
+                    # Filtered before enumerate, not inside the body: event_index stays
+                    # a contiguous 1..N over the rows actually written, and a dropped
+                    # event never reaches _event_row's opponent search. A generator, so
+                    # this holds no more in memory than the loop it replaces.
                     for i, ev in enumerate(
-                        sorted(events, key=lambda e: e.get("startDateTime") or ""),
+                        (
+                            e
+                            for e in sorted(
+                                events, key=lambda e: e.get("startDateTime") or ""
+                            )
+                            if _keep_event(e)
+                        ),
                         start=1,
                     ):
                         row = _event_row(school, ev, i, names, resolve_opponent)

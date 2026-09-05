@@ -331,6 +331,21 @@ def pick(candidates, row):
     return best, ("middle" if is_middle(best) else "city"), round(sim, 3)
 
 
+def has_vs(title):
+    """True when an event title names two sides with GoFan's ``vs`` delimiter.
+
+    The same delimiter ``parse_opponent`` splits on, asked as a yes/no question. A title
+    without it is not a game against one named opponent -- it is a season pass, a
+    tournament day, a tri-match or an invitational -- and a middle-school schedule has
+    nothing to put in its opponent column.
+
+    The title is padded before the search because ``_VS_SPLIT`` needs whitespace on both
+    sides: real titles omit the host and open with the delimiter ("vs Lake Nona MS",
+    "Vs Davis Emerson"), and unpadded those would read as no-opponent rows.
+    """
+    return bool(_VS_SPLIT.search(f" {title or ''} "))
+
+
 def parse_opponent(title, own_names):
     """Read the opponent's name out of an event title, or "" if there isn't one.
 
