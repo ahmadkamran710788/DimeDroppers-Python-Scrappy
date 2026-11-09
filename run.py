@@ -10,6 +10,7 @@
 Anything after the state list is forwarded to ``scrapy crawl`` as-is, e.g.
     python run.py wy -s JOBDIR=.jobs/wy        # make it resumable
 """
+import utils.session
 import sys
 
 from scrapy.cmdline import execute
