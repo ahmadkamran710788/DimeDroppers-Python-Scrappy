@@ -11,7 +11,11 @@ cannot be restarted in-process, so this service uses an async **job** model:
     DELETE /scrape/{job_id}           -> { deleted: true }  (frontend calls after download)
     GET  /states                      -> [ { code, name }, ... ]
     GET  /sports                      -> [ "Football", ... ]
-    GET  /health                      -> { ok: true }
+    GET  /health                      -> { ok: true, maxpreps: {...} }  (never blocks)
+    GET  /health/maxpreps             -> fresh check: can this server reach MaxPreps?
+
+CSV-seeded jobs (upload a CSV of MaxPreps school links) live under ``/scrape/csv`` --
+see ``csv_seed_api.py``. They have their own registry, survive restarts, and resume.
 
 Each crawl runs in its OWN subprocess (``worker.py``) so the one-reactor-per-process
 limit is respected. Results are transient CSV files under ``jobs/<job_id>/`` -- nothing
@@ -29,8 +33,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+import csv_seed_api
+from maxpreps_scraper import access
 from maxpreps_scraper.states import STATES
 from middle_school_api import router as middle_school_router
+from worker import EXIT_BLOCKED, JOB_ERROR_FILE
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -82,6 +89,11 @@ app.add_middleware(
 # from the MaxPreps endpoints below: its own job registry, output dir, concurrency cap
 # and runtime backstop all live in middle_school_api.py. See that module's docstring.
 app.include_router(middle_school_router)
+
+# CSV-seeded MaxPreps jobs (POST /scrape/csv ...). Mounted BEFORE the /scrape/{job_id}
+# routes below so its literal /scrape/csv paths are matched first. Separate registry,
+# directory, concurrency and liveness rules -- see csv_seed_api.py.
+app.include_router(csv_seed_api.router)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,9 +149,20 @@ def _refresh_status(job_id):
         job["status"] = "done"
     else:
         job["status"] = "error"
-        job["error"] = f"crawl process exited with code {rc}"
+        # worker.py writes the reason when it knows it (e.g. MaxPreps refused this server).
+        job["error"] = _job_error(job_id) or (
+            "MaxPreps refused access from this server" if rc == EXIT_BLOCKED
+            else f"crawl process exited with code {rc}")
     job["proc"] = None
     return job
+
+
+def _job_error(job_id):
+    try:
+        with open(os.path.join(_job_dir(job_id), JOB_ERROR_FILE), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
 
 
 def _refresh_all():
@@ -166,10 +189,12 @@ def _read_rows(path):
 
 @app.on_event("startup")
 def _sweep_stale_jobs():
-    """Clear any leftover job dirs from a previous run (no persistence by design)."""
+    """Clear any leftover /scrape job dirs from a previous run (no persistence by design),
+    and resume unfinished CSV-seeded jobs (which ARE persistent -- csv_seed_api.py)."""
     if os.path.isdir(JOBS_DIR):
         shutil.rmtree(JOBS_DIR, ignore_errors=True)
     os.makedirs(JOBS_DIR, exist_ok=True)
+    csv_seed_api.resume_jobs()
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +202,20 @@ def _sweep_stale_jobs():
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
-    return {"ok": True}
+    # Render's liveness check: must stay fast and always 200. The MaxPreps reachability
+    # check runs in the background (refreshed every 15 min) and is reported, never awaited.
+    return {"ok": True, "maxpreps": access.cached_status()}
+
+
+@app.get("/health/maxpreps")
+def health_maxpreps():
+    """One fresh request to a MaxPreps school page from THIS server.
+
+    ``status``: ``ok`` (MaxPreps answers us), ``blocked`` (401/403/429 -- e.g. MaxPreps
+    refusing this network) or ``error`` (network trouble; inconclusive). Check this on
+    Render before starting a long CSV job.
+    """
+    return access.fresh_status()
 
 
 @app.get("/states")

@@ -200,7 +200,9 @@ uvicorn api:app --reload          # http://localhost:8000
 | `DELETE /scrape/{job_id}` | Delete the job's temp files. |
 | `GET /states` | `[{ code, name }]` for all 50 states + DC. |
 | `GET /sports` | Common sport labels for a dropdown. |
-| `GET /health` | Health check for Render. |
+| `GET /health` | Health check for Render. Also reports whether this server can reach MaxPreps (`maxpreps.status`: `ok` / `blocked` / `error`, refreshed in the background every 15 min, never blocks). |
+| `GET /health/maxpreps` | One fresh request to a MaxPreps school page from this server. Check this before a long job. |
+| `POST /scrape/csv` … | CSV-seeded jobs: see [Scrape from your own list of schools](#scrape-from-your-own-list-of-schools-csv-upload) below. |
 
 ### Extra columns the API's CSVs carry
 
@@ -278,6 +280,79 @@ curl localhost:8000/scrape/<job_id>/download?type=teams -o teams.csv
 
 The existing CLIs (`run.py`, `max_prep_scraper.py`) are unchanged and still work.
 
+### When MaxPreps refuses the server
+
+MaxPreps answers some networks with its own `403 Forbidden` page. Observed from a non-US
+machine; the same pages load through a US connection. A blocked crawl used to retry every
+URL and finish **"done" with empty CSVs**. Now the crawl watches the raw status of every
+MaxPreps response, and stops when most of them, or all of a small run, are 403/429. The job
+then ends in `error` with the reason: *"MaxPreps refused access (HTTP 403) from this server…"*.
+
+Check from the machine that will run the job. Render runs in a US region by default.
+
+```bash
+curl https://<your-service>.onrender.com/health/maxpreps   # {"status": "ok"} = good to go
+```
+
+### Scrape from your own list of schools (CSV upload)
+
+Instead of crawling states, upload a CSV of MaxPreps school links and pick the sport(s).
+Only the `maxPrepsLink` column is read; any other columns are ignored. For every school,
+and for each selected sport, the job fetches:
+- every team on the school page: every level (Varsity / JV / Freshman) and gender
+  (Boys / Girls), current season;
+- each team's **schedule** (all games), **roster** and **staff**.
+
+Opponents get **school rows only**: no opponent schedules or rosters. The output is the same
+three CSVs with exactly the same columns as `POST /scrape`, plus `coverage.csv`.
+
+| Method & path | Purpose |
+|---|---|
+| `POST /scrape/csv` | Multipart: `file` (CSV with a `maxPrepsLink` column), `sports` (e.g. `Basketball`, `Football,Soccer`, or `all`). Returns `{ job_id, status, links, skipped }`. Rejects files with no usable links (400) and a second concurrent job (429). |
+| `GET /scrape/csv/{job_id}` | Status, current `phase`, live `progress` counters (pages ok / empty / failed / pending per kind; rows so far) and `error`. |
+| `GET /scrape/csv/{job_id}/download?type=teams\|schedule\|roster\|coverage` | The final file when done. **While running (or after an error) you get a partial snapshot** (`<type>_partial.csv`) with the same header. |
+| `GET /scrape/csv/{job_id}/results?type=…&offset=&limit=` | Rows as JSON, paginated (max 1000 per page). |
+| `POST /scrape/csv/{job_id}/resume` | Continue a job that ended in `error` (e.g. after MaxPreps access was fixed). Nothing already fetched is redone. |
+| `DELETE /scrape/csv/{job_id}` | Stop the job and delete its files. |
+
+```bash
+curl -F file=@schools.csv -F sports=Basketball localhost:8000/scrape/csv
+curl localhost:8000/scrape/csv/<job_id>
+curl "localhost:8000/scrape/csv/<job_id>/download?type=schedule" -o schedule.csv
+```
+
+**`coverage.csv`** is the guarantee that no schedule is silently missing. It has one row per
+page the job was responsible for:
+- each uploaded school;
+- each team's schedule, roster and staff page;
+- each unusable input row.
+
+Each row's `status` is one of:
+- `ok`, with a detail such as "12 games";
+- `empty`, e.g. "no team for the selected sport", "0 games";
+- `failed`, with the HTTP status or error;
+- `no_data`;
+- `skipped`, for input rows.
+
+Pages that fail are retried in a dedicated pass after the crawl. Whatever still fails is
+listed here, not dropped.
+
+**Time:** about 13 pages per school per sport. At the default polite rate (~1.3 pages/s),
+~5,000 schools take about **15–18 hours per sport**.
+
+**Restarts:** jobs are built to run that long.
+- Each job lives in `CSV_JOBS_DIR` with a resumable crawl queue and a SQLite store.
+- On startup the API relaunches every unfinished job, and it continues where it stopped
+  with no duplicate rows.
+- On Render, put `CSV_JOBS_DIR` on a **persistent disk** (see `render.yaml`). Without one a
+  deploy loses in-flight jobs.
+
+The same job can run without the API. Re-running the same command resumes it:
+
+```bash
+python csv_worker.py csv_jobs/myjob schools.csv Basketball
+```
+
 ### Deploy on Render
 
 `render.yaml` defines a single Python **web service**:
@@ -286,7 +361,12 @@ The existing CLIs (`run.py`, `max_prep_scraper.py`) are unchanged and still work
 - Start: `uvicorn api:app --host 0.0.0.0 --port $PORT`
 - Health check: `/health`
 - Env: `FRONTEND_ORIGIN` (comma-separated allowed origins; default `*`),
-  `MAX_CONCURRENT_JOBS` (default `2`).
+  `MAX_CONCURRENT_JOBS` (default `2`); CSV jobs: `CSV_JOBS_DIR`,
+  `CSV_MAX_CONCURRENT_JOBS` (`1`), `CSV_JOB_STALL_SECONDS` (`1800`),
+  `CSV_JOB_MAX_RUNTIME_SECONDS` (`0` = no cap).
+- Optional persistent disk for CSV jobs. It is commented out in `render.yaml`. It is a paid
+  add-on, and a service with a disk restarts on deploy. Enable it and set
+  `CSV_JOBS_DIR=/var/data/csv_jobs` so multi-hour CSV jobs survive deploys.
 
 In the Render dashboard: **New + -> Blueprint**, point at this repo, deploy. After
 the frontend is deployed, set `FRONTEND_ORIGIN` to your Vercel URL to lock down CORS.

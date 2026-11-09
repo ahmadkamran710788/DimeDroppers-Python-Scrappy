@@ -12,21 +12,27 @@ SPIDER_MODULES = ["maxpreps_scraper.spiders"]
 NEWSPIDER_MODULE = "maxpreps_scraper.spiders"
 
 # --- identity & politeness ------------------------------------------------- #
-USER_AGENT = (
+# Env overrides exist only for an arrangement with MaxPreps (an agreed identity, an
+# issued token, an agreed rate). UNSET = exactly the values this project always used.
+_DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+USER_AGENT = os.environ.get("MAXPREPS_USER_AGENT", "").strip() or _DEFAULT_USER_AGENT
 ROBOTSTXT_OBEY = True
 
 DEFAULT_REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+# Optional "Name: value" header, sent to maxpreps.com ONLY (access.MaxPrepsHeadersMiddleware)
+# -- the enrichment steps also call GoFan/NFHS, and a MaxPreps credential must not leak there.
+MAXPREPS_AUTH_HEADER = os.environ.get("MAXPREPS_AUTH_HEADER", "").strip()
 
 # --- concurrency / throttling ---------------------------------------------- #
 CONCURRENT_REQUESTS = 8
 CONCURRENT_REQUESTS_PER_DOMAIN = 4
-DOWNLOAD_DELAY = 0.75
+DOWNLOAD_DELAY = float(os.environ.get("MAXPREPS_DOWNLOAD_DELAY", "0.75"))
 DOWNLOAD_TIMEOUT = 30
 
 AUTOTHROTTLE_ENABLED = True
@@ -39,6 +45,19 @@ AUTOTHROTTLE_TARGET_CONCURRENCY = 3.0
 RETRY_ENABLED = True
 RETRY_TIMES = 4
 RETRY_HTTP_CODES = [403, 429, 500, 502, 503, 504, 408, 522, 524]
+
+# --- access: MaxPreps-only header + block circuit-breaker (see access.py) --- #
+# Neither changes a request. The breaker sits below RetryMiddleware (550) so it sees raw
+# statuses, and stops the crawl when MaxPreps is refusing most of them -- instead of the
+# old behaviour of retrying every URL for hours and finishing "done" with empty CSVs.
+DOWNLOADER_MIDDLEWARES = {
+    "maxpreps_scraper.access.MaxPrepsHeadersMiddleware": 401,
+    "maxpreps_scraper.access.MaxPrepsBlockBreaker": 555,
+}
+MAXPREPS_BLOCK_WINDOW = int(os.environ.get("MAXPREPS_BLOCK_WINDOW", "50"))
+MAXPREPS_BLOCK_RATIO = float(os.environ.get("MAXPREPS_BLOCK_RATIO", "0.8"))
+# Where the breaker writes blocked.json. Unset here; the job runners set it per job.
+MAXPREPS_BLOCK_MARKER = ""
 
 # --- caching (handy while developing; disable for a fresh full crawl) ------- #
 HTTPCACHE_ENABLED = False

@@ -8,6 +8,17 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+    # --- Persistent disk for CSV-seeded jobs (POST /scrape/csv) -----------------------
+    # A CSV job runs ~15-18 h per sport for ~5,000 schools. Without a disk, every deploy or
+    # restart wipes its directory and the job is lost; WITH one, the job resumes where it
+    # stopped (csv_seed_api.resume_jobs). Disks are a paid add-on, a service with a disk
+    # restarts (no zero-downtime) on deploy, and a disk attaches to ONE service -- so the
+    # API and the crawler must stay in this one web service. To enable, uncomment AND set
+    # CSV_JOBS_DIR below to /var/data/csv_jobs.
+    # disk:
+    #   name: scraper-data
+    #   mountPath: /var/data
+    #   sizeGB: 5
     envVars:
       # Comma-separated list of allowed frontend origins, e.g.
       #   https://your-app.vercel.app
@@ -72,3 +83,30 @@ services:
       # upload filling the instance's disk.
       - key: MS_MAX_UPLOAD_BYTES
         value: "1073741824"
+      # --- CSV-seeded MaxPreps jobs (POST /scrape/csv) ----------------------------------
+      # Independent of the /scrape knobs above: own registry, directory, concurrency and
+      # liveness rules (csv_seed_api.py). Job dirs + registry live here; point it at the
+      # persistent disk (/var/data/csv_jobs) once the disk block above is enabled. Unset =
+      # <repo>/csv_jobs (ephemeral on Render: a deploy loses in-flight jobs).
+      # - key: CSV_JOBS_DIR
+      #   value: /var/data/csv_jobs
+      # One at a time: a job already runs at the polite crawl rate MaxPreps sees from us.
+      - key: CSV_MAX_CONCURRENT_JOBS
+        value: "1"
+      # Liveness, not a runtime budget: a job is restarted (it resumes) only if its worker
+      # stops heartbeating (every 30 s) for this long. There is no total-runtime cap.
+      - key: CSV_JOB_STALL_SECONDS
+        value: "1800"
+      - key: CSV_JOB_MAX_RUNTIME_SECONDS
+        value: "0"
+      # --- MaxPreps request identity (leave UNSET) ---------------------------------------
+      # Only for an arrangement with MaxPreps. Unset = exactly the User-Agent, headers and
+      # crawl rate this project always used. MAXPREPS_AUTH_HEADER ("Name: value") is sent to
+      # maxpreps.com only, never to GoFan/NFHS. Check reachability from this server with
+      # GET /health/maxpreps before starting a long CSV job.
+      # - key: MAXPREPS_USER_AGENT
+      #   value: ""
+      # - key: MAXPREPS_AUTH_HEADER
+      #   value: ""
+      # - key: MAXPREPS_DOWNLOAD_DELAY
+      #   value: "0.75"

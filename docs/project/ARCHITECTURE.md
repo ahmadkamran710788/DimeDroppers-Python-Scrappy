@@ -8,7 +8,8 @@
 Last verified against commit `3fcc39e`, **plus uncommitted work** adding the third
 output, `roster.csv` (§7.3). Breadth-first scheduling (§4.3), opponent schools in the
 teams CSV (§7.2) and MaxPreps' own GoFan/NFHS links (§7.1b) are all in.
-~4,200 LOC, 25 Python files, no tests, no CI.
+Since then: the **CSV-seeded job** path (§7.4) and the **MaxPreps access** layer (§7.5).
+No CI; offline tests for the CSV-seed path live in `tests/test_csv_seed.py`.
 
 ---
 
@@ -38,12 +39,16 @@ produce three transient CSVs per job.
 | `rosterinfo.py` | `roster_rows(response, team, school, category)` — the **one** roster/staff page → `ROSTER_FIELDS` mapper. Shared by the spider and `enrich_roster.py`. Also `team_subpage()` and `cell_text()` |
 | `schoolinfo.py` | `school_row(page_props, url, discovered_via, html)` — the **one** `pageProps` → `SCHOOL_FIELDS` mapper. Shared by the spider and the opponent harvest so they can't drift. Also `state_linking()` (§7.1a) and `partner_links()`, the GoFan/NFHS link scanner (§7.1b) |
 | `states.py` | 50 states + DC, code→name |
+| `access.py` | MaxPreps access: block circuit-breaker + MaxPreps-only header middlewares, advisory `/health` probe (§7.5) |
 | `settings.py` | Politeness, throttling, memory/time guards |
 | **Entry points** | |
 | `api.py` | FastAPI service. Async job model, in-memory `JOBS` dict |
 | `worker.py` | One crawl + the whole enrichment chain, one per subprocess |
 | `max_prep_scraper.py` | `FilteredMaxPrepsSpider`, `MaxPrepTwoFilePipeline`, `run_crawl()` |
 | `run.py` | Thin `scrapy crawl` wrapper for the canonical CLI |
+| `csv_seed_scraper.py` | `CsvSeedMaxPrepsSpider` (seeded from an uploaded CSV's `maxPrepsLink`), `CsvSeedPipeline` (SQLite + coverage), `run_csv_crawl()` (§7.4) |
+| `csv_worker.py` | One CSV-seeded job, resumable phases: seed → crawl → retry → export → enrich → finalize |
+| `csv_seed_api.py` | `/scrape/csv` router: persistent registry, auto-resume at startup, heartbeat liveness, mid-run snapshots |
 | `backfill_all.py` | Per-state, uncapped, resumable full backfill orchestrator |
 | **Enrichment** | |
 | `enrich_gofan.py` | GoFan catalog + the 3-tier `Matcher`. **The matching brain** — reused elsewhere |
@@ -230,7 +235,16 @@ Used by `api.py` → `worker.py` → `run_crawl()`.
 - Sets `JOBDIR` inside the per-job `output_dir` so the pending-request queue spills to
   disk instead of OOMing the box (keeps a crawl at ~55–70 MB observed).
 
-**Column contract:** both pipelines write `SCHOOL_FIELDS` / `GAME_FIELDS` / `ROSTER_FIELDS` from
+### 5.3 CSV-seed path — `CsvSeedPipeline` (`csv_seed_scraper.py`)
+
+Used by `csv_worker.py`. **SQLite only**, in the job's own directory (never `output/`):
+`MultiFormatPipeline`'s schema and PKs (reused via `_init_db`), plus a `coverage` table, in
+WAL mode so the worker's progress poll and the API's snapshot can read while it writes.
+`MaxPrepTwoFilePipeline` is unusable here: it opens its CSVs in `"w"` mode, so a resumed
+multi-hour job would truncate everything gathered before. The three API-named CSVs are
+exported from the DB at the end (`export_db(..., names=..., write_json=False)`).
+
+**Column contract:** every pipeline writes `SCHOOL_FIELDS` / `GAME_FIELDS` / `ROSTER_FIELDS` from
 `maxpreps_scraper/export.py`. If you add an item field, add it there too or it
 silently won't reach any CSV (`extrasaction="ignore"`).
 
@@ -465,6 +479,86 @@ never crawled. §7.2 closes that for its *school row*; this closes it for its *r
 - Writes atomically and **only when it added something**, so a run that finds nothing to
   do leaves the CSV byte-identical.
 
+### 7.4 CSV-seeded jobs (`POST /scrape/csv`)
+
+Crawls **a user-supplied list of schools** instead of states:
+- **Input.** The upload's `maxPrepsLink` column, trimmed to school roots and deduped.
+  MaxPreps' internal test schools are skipped.
+- **Per school, for the selected sports:** every team in `sportSeasons` (all levels and
+  genders, current season), with its schedule, roster and staff.
+- **Opponents:** school rows only, via the unchanged harvest (phase 2.5).
+
+`CsvSeedMaxPrepsSpider` subclasses `FilteredMaxPrepsSpider` and changes only:
+- seeding;
+- `discover=0`: no nearby schools, and opponent links are not followed;
+- coverage tagging;
+- the schedule parser, which reads **every** qualifying table (§9.3) and skips a table only
+  when it is an exact duplicate render.
+
+**Coverage is the "nothing missed" mechanism.**
+- Every page the job owns gets a `coverage` row: `pending` when requested, then `ok` /
+  `empty` / `failed` (`retryable` 0/1) / `no_data`. Unusable input rows are `skipped`.
+- `pending` is `INSERT OR IGNORE`, so it can never overwrite a resolved page (it can arrive
+  late on resume). Final statuses are `INSERT OR REPLACE`.
+- A 200 page without `__NEXT_DATA__` is a `failed` interstitial, never an "empty" schedule.
+- After the crawl, `retry` mode re-requests every `pending` and retryable `failed` page:
+  fresh dupefilter, no JOBDIR. That covers dupefiltered redirects and pages in flight when
+  the crawl stopped.
+- What still fails is in `coverage.csv`. The job is `error`, not `done`, if no school page
+  resolved at all.
+
+**Resumable by construction.**
+- JOBDIR queue + SQLite (`INSERT OR REPLACE` on PKs) + `state.json` phase markers.
+- `CLOSESPIDER_TIMEOUT=0`: the list bounds the work, and a time cap is exactly how schedules
+  get dropped.
+- `csv_worker.py` relaunches the crawl subprocess when it stops early (memory guard, stall
+  watchdog, host restart).
+- `csv_seed_api.resume_jobs()` (called from api.py's startup) relaunches unfinished jobs.
+- File locks (`worker.lock`, `crawl.lock`) stop two processes sharing a JOBDIR. The API also
+  uses `worker.lock` to *adopt* a worker that outlived it (uvicorn `--reload`).
+- On Render, `CSV_JOBS_DIR` must be on a persistent disk for any of this to survive a deploy.
+
+**Enrichment** reuses `worker.run_enrichment()` (extracted from `worker.py`, unchanged order)
+with larger timeouts and `run_roster=False`. Phase 2.6 would fetch rosters for the
+harvested *opponent* schools, which this job excludes. Rosters for the listed schools are
+already fetched in-crawl.
+
+Runtime: about 13 pages per school per sport at ~1.3 pages/s (`DOWNLOAD_DELAY` 0.75 on one
+domain slot). That is **~15–18 h per sport for ~5,000 schools**.
+
+### 7.5 MaxPreps access — when it refuses the server (`maxpreps_scraper/access.py`)
+
+MaxPreps serves its own `403` page to some networks. It has been seen from a non-US dev
+machine, where the same pages load through a US connection, so it looks like a geo-block;
+Render's US regions are expected to pass. A blocked crawl used to retry every URL and
+finish **"done" with empty CSVs** (the August 2026 empty crawls).
+
+- **`MaxPrepsBlockBreaker`** (downloader mw at 555, i.e. *below* RetryMiddleware 550, so it
+  sees raw statuses) has two rules:
+  - it stops the crawl with reason `maxpreps_blocked` when ≥ `MAXPREPS_BLOCK_RATIO` (0.8) of
+    the last `MAXPREPS_BLOCK_WINDOW` (50) MaxPreps responses were 401/403/429;
+  - at close, a run where **every** MaxPreps response was a refusal is also marked blocked.
+    A one-state `/scrape` makes only 5 raw requests and never fills the window.
+
+  robots.txt and other hosts never count. When `MAXPREPS_BLOCK_MARKER` is set (per job), it
+  writes `blocked.json`:
+  - `worker.py` turns that into exit 3 + `job_error.txt`, which `api.py` shows;
+  - `csv_worker.py` fails the job; it is resumable later via `/resume`.
+
+  In a **retry** pass the marker is ignored, because a retry pass contains only problem pages.
+- **`MaxPrepsHeadersMiddleware`** sends an optional `MAXPREPS_AUTH_HEADER` to maxpreps.com
+  **only**. The harvest/roster steps use project settings too, and a MaxPreps credential
+  must never reach GoFan/NFHS.
+- **`probe()` / `cached_status()`** back `/health` and `/health/maxpreps`. They are
+  **advisory only**: urllib is a different client from the crawl's, so it never refuses a
+  job; the crawl's own breaker is the authority.
+- **Identity env vars:** `MAXPREPS_USER_AGENT`, `MAXPREPS_AUTH_HEADER`,
+  `MAXPREPS_DOWNLOAD_DELAY`. Unset means byte-identical requests to before (asserted in
+  the tests).
+- **No circumvention, by policy:** no browser impersonation, stealth browsers or proxy
+  rotation. A refused network needs a network MaxPreps accepts or an arrangement with
+  MaxPreps.
+
 ---
 
 ## 8. The matching logic
@@ -669,6 +763,13 @@ distinct candidates — but still a serial stall inside the 900s budget on a big
 10. **New item field ⇒ add it to `export.py`'s field lists**, or it silently never
     reaches a CSV. The reverse also bites: a name in a field list with no matching
     `scrapy.Field()` raises `KeyError` when the spider constructs the item.
+11. **The CSV-seed path never follows opponents in-crawl** and never runs phase 2.6;
+    opponents get school rows only (harvest). Its three CSVs keep the exact `/scrape` headers
+    (snapshots included: `csv_seed_api.SNAPSHOT_EXTRA`).
+12. **`pending` coverage never overwrites** (`INSERT OR IGNORE`); a 200 page without
+    `__NEXT_DATA__` is `failed`, never `empty`. Keep both, or "nothing missed" stops being true.
+13. **Access defaults are frozen**: with no `MAXPREPS_*` env vars set, User-Agent, headers and
+    delay are exactly the historical values. The auth header goes to maxpreps.com only.
 
 ---
 
@@ -710,6 +811,12 @@ python enrich_roster.py   output/max_prep_roster.csv output/max_prep_School.csv 
 python enrich_opponent.py         output/max_prep_schedule.csv output/max_prep_School.csv
 python enrich_opponent.py harvest output/max_prep_schedule.csv output/max_prep_School.csv
 python enrich_opponent.py resolve output/max_prep_schedule.csv output/max_prep_School.csv
+
+# --- CSV-seeded job (§7.4): same three CSVs + coverage.csv; re-run = resume ---
+python csv_worker.py csv_jobs/myjob schools.csv Basketball
+curl -F file=@schools.csv -F sports=Basketball localhost:8000/scrape/csv
+curl localhost:8000/health/maxpreps                 # can THIS server reach MaxPreps?
+.venv/bin/python -m unittest tests.test_csv_seed -v  # offline tests
 
 # --- which GoFan/NFHS links does MaxPreps publish? (diagnostic, §7.1b) ---
 python scripts/probe_partner_links.py https://www.maxpreps.com/ca/stockton/lincoln-trojans/

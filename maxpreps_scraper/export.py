@@ -41,13 +41,19 @@ ROSTER_FIELDS = [
 LIST_FIELDS = {"sports"}  # stored as "a; b; c" text in SQLite -> list in JSON
 
 
-def _export_table(db, table, fields, csv_path, json_path):
+def _export_table(db, table, fields, csv_path, json_path=None):
+    """Write one table to CSV (and JSON when ``json_path`` is given). Atomic per file."""
     rows = db.execute(f"SELECT {','.join(fields)} FROM {table}").fetchall()
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+    tmp = csv_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(fields)
         w.writerows(rows)
+    os.replace(tmp, csv_path)
+
+    if not json_path:
+        return len(rows)
 
     with open(json_path, "w", encoding="utf-8") as fh:
         fh.write("[")
@@ -62,34 +68,33 @@ def _export_table(db, table, fields, csv_path, json_path):
     return len(rows)
 
 
-def export_db(output_dir="output", db_file="maxpreps.db"):
-    """Rebuild schools/schedule/roster {csv,json} from the SQLite DB.
+# Default output basenames (the canonical CLI files). The CSV-seed worker passes the API
+# names instead (max_prep_School / max_prep_schedule / max_prep_roster).
+DEFAULT_NAMES = ("schools", "schedule", "roster")
 
+
+def export_db(output_dir="output", db_file="maxpreps.db", names=DEFAULT_NAMES, write_json=True):
+    """Rebuild schools/schedule/roster CSV (+ JSON) from the SQLite DB.
+
+    ``names`` are the three output basenames, in schools/schedule/roster order.
     Returns ``(n_schools, n_games, n_roster)``.
     """
     db_path = os.path.join(output_dir, db_file)
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"No database at {db_path}")
-    db = sqlite3.connect(db_path)
+    db = sqlite3.connect(db_path, timeout=60)
     try:
-        n_schools = _export_table(
-            db, "schools", SCHOOL_FIELDS,
-            os.path.join(output_dir, "schools.csv"),
-            os.path.join(output_dir, "schools.json"),
-        )
-        n_games = _export_table(
-            db, "games", GAME_FIELDS,
-            os.path.join(output_dir, "schedule.csv"),
-            os.path.join(output_dir, "schedule.json"),
-        )
-        n_roster = _export_table(
-            db, "roster", ROSTER_FIELDS,
-            os.path.join(output_dir, "roster.csv"),
-            os.path.join(output_dir, "roster.json"),
-        )
+        counts = []
+        for table, fields, name in zip(("schools", "games", "roster"),
+                                       (SCHOOL_FIELDS, GAME_FIELDS, ROSTER_FIELDS), names):
+            counts.append(_export_table(
+                db, table, fields,
+                os.path.join(output_dir, f"{name}.csv"),
+                os.path.join(output_dir, f"{name}.json") if write_json else None,
+            ))
     finally:
         db.close()
-    return n_schools, n_games, n_roster
+    return tuple(counts)
 
 
 if __name__ == "__main__":

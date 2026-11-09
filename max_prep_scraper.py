@@ -218,6 +218,9 @@ def run_crawl(states, sports, levels="all", discover=True, output_dir=None, rost
         # entirely in RAM and OOM the instance. JOBDIR spills it to disk. Each API job
         # gets a unique output_dir, so this dir is always fresh (no accidental resume).
         settings.set("JOBDIR", os.path.join(output_dir, ".crawljob"))
+        # If MaxPreps refuses most requests, the block breaker (maxpreps_scraper/access.py)
+        # stops the crawl and drops this marker; worker.py turns it into a clear job error.
+        settings.set("MAXPREPS_BLOCK_MARKER", os.path.join(output_dir, "blocked.json"))
 
     process = CrawlerProcess(settings)
     process.crawl(

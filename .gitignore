@@ -9,3 +9,4 @@ ms_jobs/
 __pycache__/
 *.pyc
 *.db
+csv_jobs/
